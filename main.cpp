@@ -21,6 +21,8 @@
 #include <sstream>
 #include <array>
 #include <iostream>
+#include <cfloat>  // Para FLT_MAX
+#include <limits>  // Para límites numéricos
 
 // ============================
 // Configuración Global Mejorada
@@ -738,6 +740,2697 @@ public:
         return characters.size();
     }
 };
+// ============================
+// 🎯 Motor de Física 2D Nativo (Arcade) - INTEGRADO
+// ============================
+
+
+struct RaycastHit2D {
+    int bodyId;
+    float distance;
+    float pointX, pointY;
+    float normalX, normalY;
+    bool hit;
+    
+    RaycastHit2D() : bodyId(-1), distance(0), pointX(0), pointY(0),
+                    normalX(0), normalY(0), hit(false) {}
+};
+
+struct Collision2D {
+    int bodyA, bodyB;
+    float overlap;
+    float normalX, normalY;
+    float contactX, contactY;
+    bool resolved;
+    
+    Collision2D() : bodyA(-1), bodyB(-1), overlap(0), normalX(0), normalY(0),
+                   contactX(0), contactY(0), resolved(false) {}
+};
+    
+    
+class UltraPhysics2D {
+private:
+    struct Body2D {
+        int id;
+        float x, y;
+        float width, height;
+        float vx, vy;
+        float ax, ay;
+        bool isStatic;
+        bool isKinematic;
+        bool enabled;
+        int layer;
+        int mask;
+        float restitution;
+        float friction;
+        void* userData;
+        std::string type;
+        
+        // Para detección continua
+        float prevX, prevY;
+        
+        // Para SAT (Separating Axis Theorem)
+        std::vector<std::pair<float, float>> vertices;
+        std::vector<std::pair<float, float>> axes;
+        
+        Body2D() : id(-1), x(0), y(0), width(1), height(1), vx(0), vy(0), 
+                   ax(0), ay(0), isStatic(false), isKinematic(false), 
+                   enabled(true), layer(1), mask(0xFFFF), restitution(0.3f),
+                   friction(0.1f), userData(nullptr), prevX(0), prevY(0) {}
+    };
+    
+// ============================
+// Estructuras para Physics2D - MOVIDAS FUERA DE LA CLASE
+// ============================
+
+
+    std::vector<Body2D> bodies;
+    std::vector<Collision2D> collisions;
+    std::vector<RaycastHit2D> raycastHits;
+    float gravityX, gravityY;
+    int nextBodyId;
+    bool enableContinuousDetection;
+    int velocityIterations;
+    int positionIterations;
+    
+    // Spatial partitioning
+    std::unordered_map<int, std::vector<int>> grid;
+    float cellSize;
+    int gridWidth, gridHeight;
+    
+public:
+    UltraPhysics2D(float worldWidth = 1000.0f, float worldHeight = 1000.0f, float gravity = 9.81f)
+        : gravityX(0), gravityY(gravity), nextBodyId(0), 
+          enableContinuousDetection(true), velocityIterations(8), positionIterations(3),
+          cellSize(50.0f), gridWidth(static_cast<int>(worldWidth / cellSize) + 1),
+          gridHeight(static_cast<int>(worldHeight / cellSize) + 1) {
+        bodies.reserve(1000);
+        collisions.reserve(500);
+        raycastHits.reserve(100);
+    }
+    
+    // ==================== CREACIÓN Y GESTIÓN DE CUERPOS ====================
+    
+    int createBody(float x, float y, float width, float height, bool isStatic = false) {
+        Body2D body;
+        body.id = nextBodyId++;
+        body.x = x;
+        body.y = y;
+        body.prevX = x;
+        body.prevY = y;
+        body.width = width;
+        body.height = height;
+        body.isStatic = isStatic;
+        body.type = "AABB";
+        
+        // Calcular vértices para AABB
+        updateBodyVertices(body);
+        
+        bodies.push_back(body);
+        updateGrid(body.id);
+        return body.id;
+    }
+    
+    int createCircle(float x, float y, float radius, bool isStatic = false) {
+        Body2D body;
+        body.id = nextBodyId++;
+        body.x = x;
+        body.y = y;
+        body.prevX = x;
+        body.prevY = y;
+        body.width = radius * 2;
+        body.height = radius * 2;
+        body.isStatic = isStatic;
+        body.type = "Circle";
+        
+        // Calcular vértices para círculo (aproximación con 8 vértices)
+        for (int i = 0; i < 8; i++) {
+            float angle = (i / 8.0f) * 2 * M_PI;
+            body.vertices.push_back({
+                x + radius * cos(angle),
+                y + radius * sin(angle)
+            });
+        }
+        updateBodyAxes(body);
+        
+        bodies.push_back(body);
+        updateGrid(body.id);
+        return body.id;
+    }
+    
+    int createPolygon(float x, float y, const std::vector<std::pair<float, float>>& vertices, bool isStatic = false) {
+        Body2D body;
+        body.id = nextBodyId++;
+        body.x = x;
+        body.y = y;
+        body.prevX = x;
+        body.prevY = y;
+        body.isStatic = isStatic;
+        body.type = "Polygon";
+        body.vertices = vertices;
+        
+        // Calcular AABB bounds usando FLT_MAX de manera segura
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float maxX = std::numeric_limits<float>::lowest();
+        float maxY = std::numeric_limits<float>::lowest();
+        
+        for (const auto& v : vertices) {
+            minX = std::min(minX, v.first);
+            minY = std::min(minY, v.second);
+            maxX = std::max(maxX, v.first);
+            maxY = std::max(maxY, v.second);
+        }
+        body.width = maxX - minX;
+        body.height = maxY - minY;
+        
+        updateBodyAxes(body);
+        bodies.push_back(body);
+        updateGrid(body.id);
+        return body.id;
+    }
+    
+    void updateBodyVertices(Body2D& body) {
+        body.vertices.clear();
+        body.vertices.push_back({body.x - body.width/2, body.y - body.height/2});
+        body.vertices.push_back({body.x + body.width/2, body.y - body.height/2});
+        body.vertices.push_back({body.x + body.width/2, body.y + body.height/2});
+        body.vertices.push_back({body.x - body.width/2, body.y + body.height/2});
+        updateBodyAxes(body);
+    }
+    
+    void updateBodyAxes(Body2D& body) {
+        body.axes.clear();
+        int vertexCount = body.vertices.size();
+        
+        for (int i = 0; i < vertexCount; i++) {
+            int next = (i + 1) % vertexCount;
+            float dx = body.vertices[next].first - body.vertices[i].first;
+            float dy = body.vertices[next].second - body.vertices[i].second;
+            
+            // Normal perpendicular
+            float length = sqrt(dx*dx + dy*dy);
+            if (length > 0) {
+                body.axes.push_back({-dy/length, dx/length});
+            }
+        }
+    }
+    
+    // ==================== DETECCIÓN DE COLISIONES ====================
+    
+    void update(float dt) {
+        // Guardar posiciones anteriores para detección continua
+        for (auto& body : bodies) {
+            if (!body.isStatic && body.enabled) {
+                body.prevX = body.x;
+                body.prevY = body.y;
+                
+                // Integración de velocidad
+                body.vx += body.ax * dt;
+                body.vy += body.ay * dt;
+                
+                // Aplicar gravedad
+                if (!body.isKinematic) {
+                    body.vx += gravityX * dt;
+                    body.vy += gravityY * dt;
+                }
+                
+                // Integración de posición
+                body.x += body.vx * dt;
+                body.y += body.vy * dt;
+                
+                // Actualizar vértices si es necesario
+                if (body.type != "Circle") {
+                    updateBodyVertices(body);
+                }
+                
+                updateGrid(body.id);
+            }
+        }
+        
+        // Detección de colisiones
+        detectCollisions();
+        
+        // Resolución de colisiones
+        resolveCollisions(dt);
+        
+        // Limpiar fuerzas acumuladas
+        for (auto& body : bodies) {
+            body.ax = 0;
+            body.ay = 0;
+        }
+    }
+    
+    void detectCollisions() {
+        collisions.clear();
+        
+        // Usar spatial partitioning para reducir checks
+        for (int i = 0; i < bodies.size(); i++) {
+            if (!bodies[i].enabled) continue;
+            
+            std::vector<int> potentialCollisions = getPotentialCollisions(bodies[i].id);
+            
+            for (int j : potentialCollisions) {
+                if (i >= j) continue; // Evitar duplicados
+                if (!bodies[j].enabled) continue;
+                
+                // Check de máscaras de capa
+                if (!shouldCollide(bodies[i], bodies[j])) continue;
+                
+                Collision2D collision;
+                if (checkCollision(bodies[i], bodies[j], collision)) {
+                    collisions.push_back(collision);
+                }
+            }
+        }
+    }
+    
+    std::vector<int> getPotentialCollisions(int bodyId) {
+        std::vector<int> result;
+        auto it = bodies.begin();
+        while (it != bodies.end() && it->id != bodyId) ++it;
+        if (it == bodies.end()) return result;
+        
+        Body2D& body = *it;
+        
+        // Obtener celdas grid que intersecta el cuerpo
+        int minCellX = static_cast<int>((body.x - body.width/2) / cellSize);
+        int maxCellX = static_cast<int>((body.x + body.width/2) / cellSize);
+        int minCellY = static_cast<int>((body.y - body.height/2) / cellSize);
+        int maxCellY = static_cast<int>((body.y + body.height/2) / cellSize);
+        
+        for (int x = minCellX; x <= maxCellX; x++) {
+            for (int y = minCellY; y <= maxCellY; y++) {
+                int cellKey = x * gridHeight + y;
+                auto cellIt = grid.find(cellKey);
+                if (cellIt != grid.end()) {
+                    for (int otherId : cellIt->second) {
+                        if (otherId != bodyId) {
+                            result.push_back(otherId);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return result;
+    }
+    
+    void updateGrid(int bodyId) {
+        // Remover de todas las celdas
+        for (auto& cell : grid) {
+            auto& bodiesInCell = cell.second;
+            bodiesInCell.erase(
+                std::remove(bodiesInCell.begin(), bodiesInCell.end(), bodyId),
+                bodiesInCell.end()
+            );
+        }
+        
+        // Agregar a celdas nuevas
+        auto it = bodies.begin();
+        while (it != bodies.end() && it->id != bodyId) ++it;
+        if (it == bodies.end()) return;
+        
+        Body2D& body = *it;
+        int minCellX = static_cast<int>((body.x - body.width/2) / cellSize);
+        int maxCellX = static_cast<int>((body.x + body.width/2) / cellSize);
+        int minCellY = static_cast<int>((body.y - body.height/2) / cellSize);
+        int maxCellY = static_cast<int>((body.y + body.height/2) / cellSize);
+        
+        for (int x = minCellX; x <= maxCellX; x++) {
+            for (int y = minCellY; y <= maxCellY; y++) {
+                int cellKey = x * gridHeight + y;
+                grid[cellKey].push_back(bodyId);
+            }
+        }
+    }
+    
+    bool shouldCollide(const Body2D& a, const Body2D& b) {
+        return (a.layer & b.mask) != 0 && (b.layer & a.mask) != 0;
+    }
+    
+    bool checkCollision(const Body2D& a, const Body2D& b, Collision2D& collision) {
+        if (a.type == "AABB" && b.type == "AABB") {
+            return checkAABBCollision(a, b, collision);
+        } else if (a.type == "Circle" && b.type == "Circle") {
+            return checkCircleCollision(a, b, collision);
+        } else {
+            return checkSATCollision(a, b, collision);
+        }
+    }
+    
+    bool checkAABBCollision(const Body2D& a, const Body2D& b, Collision2D& collision) {
+        float dx = b.x - a.x;
+        float dy = b.y - a.y;
+        float combinedHalfWidth = (a.width + b.width) / 2;
+        float combinedHalfHeight = (a.height + b.height) / 2;
+        
+        if (abs(dx) < combinedHalfWidth && abs(dy) < combinedHalfHeight) {
+            float overlapX = combinedHalfWidth - abs(dx);
+            float overlapY = combinedHalfHeight - abs(dy);
+            
+            collision.bodyA = a.id;
+            collision.bodyB = b.id;
+            
+            // Usar el eje de menor overlap
+            if (overlapX < overlapY) {
+                collision.overlap = overlapX;
+                collision.normalX = (dx > 0) ? 1 : -1;
+                collision.normalY = 0;
+            } else {
+                collision.overlap = overlapY;
+                collision.normalX = 0;
+                collision.normalY = (dy > 0) ? 1 : -1;
+            }
+            
+            collision.contactX = a.x + (a.width/2 * (dx > 0 ? -1 : 1));
+            collision.contactY = a.y + (a.height/2 * (dy > 0 ? -1 : 1));
+            
+            return true;
+        }
+        return false;
+    }
+    
+    bool checkCircleCollision(const Body2D& a, const Body2D& b, Collision2D& collision) {
+        float dx = b.x - a.x;
+        float dy = b.y - a.y;
+        float distance = sqrt(dx*dx + dy*dy);
+        float radiusA = a.width / 2;
+        float radiusB = b.width / 2;
+        
+        if (distance < radiusA + radiusB) {
+            collision.bodyA = a.id;
+            collision.bodyB = b.id;
+            collision.overlap = (radiusA + radiusB) - distance;
+            
+            if (distance > 0) {
+                collision.normalX = dx / distance;
+                collision.normalY = dy / distance;
+            } else {
+                collision.normalX = 1;
+                collision.normalY = 0;
+            }
+            
+            collision.contactX = a.x + collision.normalX * radiusA;
+            collision.contactY = a.y + collision.normalY * radiusA;
+            
+            return true;
+        }
+        return false;
+    }
+    
+    bool checkSATCollision(const Body2D& a, const Body2D& b, Collision2D& collision) {
+        float minOverlap = std::numeric_limits<float>::max();
+        std::pair<float, float> smallestAxis;
+        
+        // Probar ejes de A
+        for (const auto& axis : a.axes) {
+            Projection projA = projectBody(a, axis);
+            Projection projB = projectBody(b, axis);
+            
+            if (!projA.overlap(projB)) {
+                return false;
+            }
+            
+            float overlap = projA.getOverlap(projB);
+            if (overlap < minOverlap) {
+                minOverlap = overlap;
+                smallestAxis = axis;
+            }
+        }
+        
+        // Probar ejes de B
+        for (const auto& axis : b.axes) {
+            Projection projA = projectBody(a, axis);
+            Projection projB = projectBody(b, axis);
+            
+            if (!projA.overlap(projB)) {
+                return false;
+            }
+            
+            float overlap = projA.getOverlap(projB);
+            if (overlap < minOverlap) {
+                minOverlap = overlap;
+                smallestAxis = axis;
+            }
+        }
+        
+        collision.bodyA = a.id;
+        collision.bodyB = b.id;
+        collision.overlap = minOverlap;
+        collision.normalX = smallestAxis.first;
+        collision.normalY = smallestAxis.second;
+        
+        // Asegurar que la normal apunte de A a B
+        float dx = b.x - a.x;
+        float dy = b.y - a.y;
+        if (dx * collision.normalX + dy * collision.normalY < 0) {
+            collision.normalX = -collision.normalX;
+            collision.normalY = -collision.normalY;
+        }
+        
+        return true;
+    }
+    
+    struct Projection {
+        float min, max;
+        
+        bool overlap(const Projection& other) const {
+            return min <= other.max && other.min <= max;
+        }
+        
+        float getOverlap(const Projection& other) const {
+            return std::min(max, other.max) - std::max(min, other.min);
+        }
+    };
+    
+    Projection projectBody(const Body2D& body, const std::pair<float, float>& axis) {
+        float min = std::numeric_limits<float>::max();
+        float max = std::numeric_limits<float>::lowest();
+        
+        for (const auto& vertex : body.vertices) {
+            float projection = vertex.first * axis.first + vertex.second * axis.second;
+            min = std::min(min, projection);
+            max = std::max(max, projection);
+        }
+        
+        return {min, max};
+    }
+    
+    // ==================== RESOLUCIÓN DE COLISIONES ====================
+    
+    void resolveCollisions(float dt) {
+        // Múltiples iteraciones para mejor estabilidad
+        for (int i = 0; i < velocityIterations; i++) {
+            for (auto& collision : collisions) {
+                if (collision.resolved) continue;
+                
+                Body2D* bodyA = getBody(collision.bodyA);
+                Body2D* bodyB = getBody(collision.bodyB);
+                
+                if (!bodyA || !bodyB) continue;
+                
+                resolveCollision(*bodyA, *bodyB, collision, dt);
+            }
+        }
+    }
+    
+    void resolveCollision(Body2D& a, Body2D& b, Collision2D& collision, float dt) {
+        // Skip si ambos son estáticos
+        if (a.isStatic && b.isStatic) {
+            collision.resolved = true;
+            return;
+        }
+        
+        // Calcular velocidad relativa
+        float rvx = b.vx - a.vx;
+        float rvy = b.vy - a.vy;
+        
+        // Velocidad a lo largo de la normal
+        float velAlongNormal = rvx * collision.normalX + rvy * collision.normalY;
+        
+        // No resolver si se están separando
+        if (velAlongNormal > 0) {
+            collision.resolved = true;
+            return;
+        }
+        
+        // Calcular impulso
+        float restitution = std::min(a.restitution, b.restitution);
+        float j = -(1 + restitution) * velAlongNormal;
+        
+        // Masas
+        float invMassA = a.isStatic ? 0 : 1.0f;
+        float invMassB = b.isStatic ? 0 : 1.0f;
+        
+        j /= (invMassA + invMassB);
+        
+        // Aplicar impulso
+        float impulseX = j * collision.normalX;
+        float impulseY = j * collision.normalY;
+        
+        if (!a.isStatic) {
+            a.vx -= impulseX * invMassA;
+            a.vy -= impulseY * invMassA;
+        }
+        
+        if (!b.isStatic) {
+            b.vx += impulseX * invMassB;
+            b.vy += impulseY * invMassB;
+        }
+        
+        // Corrección de posición (para evitar sinking)
+        float percent = 0.8f; // 80% de corrección
+        float slop = 0.01f; // 1cm de tolerancia
+        float correction = std::max(collision.overlap - slop, 0.0f) / (invMassA + invMassB) * percent;
+        
+        float correctionX = correction * collision.normalX;
+        float correctionY = correction * collision.normalY;
+        
+        if (!a.isStatic) {
+            a.x -= correctionX * invMassA;
+            a.y -= correctionY * invMassA;
+        }
+        
+        if (!b.isStatic) {
+            b.x += correctionX * invMassB;
+            b.y += correctionY * invMassB;
+        }
+        
+        collision.resolved = true;
+    }
+    
+    // ==================== RAYCASTING ====================
+    
+    emscripten::val raycast(float startX, float startY, float endX, float endY, int layerMask = 0xFFFF) {
+        RaycastHit2D hit;
+        float closestDistance = std::numeric_limits<float>::max();
+        
+        float dirX = endX - startX;
+        float dirY = endY - startY;
+        float length = sqrt(dirX*dirX + dirY*dirY);
+        
+        if (length > 0) {
+            dirX /= length;
+            dirY /= length;
+        }
+        
+        for (const auto& body : bodies) {
+            if (!body.enabled) continue;
+            if ((body.layer & layerMask) == 0) continue;
+            
+            RaycastHit2D bodyHit;
+            if (raycastAgainstBody(startX, startY, dirX, dirY, length, body, bodyHit)) {
+                if (bodyHit.distance < closestDistance) {
+                    closestDistance = bodyHit.distance;
+                    hit = bodyHit;
+                }
+            }
+        }
+        
+        // Convertir RaycastHit2D a emscripten::val
+        emscripten::val result = emscripten::val::object();
+        result.set("bodyId", hit.bodyId);
+        result.set("distance", hit.distance);
+        result.set("pointX", hit.pointX);
+        result.set("pointY", hit.pointY);
+        result.set("normalX", hit.normalX);
+        result.set("normalY", hit.normalY);
+        result.set("hit", hit.hit);
+        
+        return result;
+    }
+    
+    bool raycastAgainstBody(float startX, float startY, float dirX, float dirY, float maxDistance, 
+                           const Body2D& body, RaycastHit2D& hit) {
+        if (body.type == "AABB") {
+            return raycastAABB(startX, startY, dirX, dirY, maxDistance, body, hit);
+        } else if (body.type == "Circle") {
+            return raycastCircle(startX, startY, dirX, dirY, maxDistance, body, hit);
+        } else {
+            return raycastPolygon(startX, startY, dirX, dirY, maxDistance, body, hit);
+        }
+    }
+    
+    bool raycastAABB(float startX, float startY, float dirX, float dirY, float maxDistance,
+                    const Body2D& body, RaycastHit2D& hit) {
+        float halfWidth = body.width / 2;
+        float halfHeight = body.height / 2;
+        
+        float t1 = (body.x - halfWidth - startX) / dirX;
+        float t2 = (body.x + halfWidth - startX) / dirX;
+        float t3 = (body.y - halfHeight - startY) / dirY;
+        float t4 = (body.y + halfHeight - startY) / dirY;
+        
+        float tmin = std::max(std::min(t1, t2), std::min(t3, t4));
+        float tmax = std::min(std::max(t1, t2), std::max(t3, t4));
+        
+        if (tmax < 0 || tmin > tmax || tmin > maxDistance) {
+            return false;
+        }
+        
+        float t = tmin < 0 ? tmax : tmin;
+        
+        hit.bodyId = body.id;
+        hit.distance = t;
+        hit.pointX = startX + t * dirX;
+        hit.pointY = startY + t * dirY;
+        hit.hit = true;
+        
+        // Calcular normal
+        if (t == t1) hit.normalX = -1, hit.normalY = 0;
+        else if (t == t2) hit.normalX = 1, hit.normalY = 0;
+        else if (t == t3) hit.normalX = 0, hit.normalY = -1;
+        else hit.normalX = 0, hit.normalY = 1;
+        
+        return true;
+    }
+    
+    bool raycastCircle(float startX, float startY, float dirX, float dirY, float maxDistance,
+                      const Body2D& body, RaycastHit2D& hit) {
+        float radius = body.width / 2;
+        
+        float toCircleX = body.x - startX;
+        float toCircleY = body.y - startY;
+        
+        float a = dirX*dirX + dirY*dirY;
+        float b = -2 * (dirX*toCircleX + dirY*toCircleY);
+        float c = toCircleX*toCircleX + toCircleY*toCircleY - radius*radius;
+        
+        float discriminant = b*b - 4*a*c;
+        
+        if (discriminant < 0) return false;
+        
+        discriminant = sqrt(discriminant);
+        float t1 = (-b - discriminant) / (2*a);
+        float t2 = (-b + discriminant) / (2*a);
+        
+        float t = (t1 >= 0 && t1 <= maxDistance) ? t1 : 
+                 (t2 >= 0 && t2 <= maxDistance) ? t2 : -1;
+        
+        if (t < 0) return false;
+        
+        hit.bodyId = body.id;
+        hit.distance = t;
+        hit.pointX = startX + t * dirX;
+        hit.pointY = startY + t * dirY;
+        hit.hit = true;
+        
+        // Calcular normal
+        hit.normalX = (hit.pointX - body.x) / radius;
+        hit.normalY = (hit.pointY - body.y) / radius;
+        
+        return true;
+    }
+    
+    bool raycastPolygon(float startX, float startY, float dirX, float dirY, float maxDistance,
+                       const Body2D& body, RaycastHit2D& hit) {
+        float closestT = maxDistance;
+        std::pair<float, float> closestNormal;
+        
+        for (int i = 0; i < body.vertices.size(); i++) {
+            int j = (i + 1) % body.vertices.size();
+            
+            float edgeX = body.vertices[j].first - body.vertices[i].first;
+            float edgeY = body.vertices[j].second - body.vertices[i].second;
+            
+            float normalX = -edgeY;
+            float normalY = edgeX;
+            float length = sqrt(normalX*normalX + normalY*normalY);
+            if (length > 0) {
+                normalX /= length;
+                normalY /= length;
+            }
+            
+            float denom = normalX * dirX + normalY * dirY;
+            if (abs(denom) < 1e-6) continue; // Paralelo
+            
+            float t = (normalX * (body.vertices[i].first - startX) + 
+                      normalY * (body.vertices[i].second - startY)) / denom;
+                      
+            if (t < 0 || t > closestT) continue;
+            
+            // Verificar si el punto está en el segmento
+            float pointX = startX + t * dirX;
+            float pointY = startY + t * dirY;
+            
+            if (pointOnSegment(pointX, pointY, body.vertices[i].first, body.vertices[i].second,
+                              body.vertices[j].first, body.vertices[j].second)) {
+                closestT = t;
+                closestNormal = {normalX, normalY};
+            }
+        }
+        
+        if (closestT <= maxDistance) {
+            hit.bodyId = body.id;
+            hit.distance = closestT;
+            hit.pointX = startX + closestT * dirX;
+            hit.pointY = startY + closestT * dirY;
+            hit.normalX = closestNormal.first;
+            hit.normalY = closestNormal.second;
+            hit.hit = true;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    bool pointOnSegment(float px, float py, float x1, float y1, float x2, float y2) {
+        float cross = (px - x1) * (y2 - y1) - (py - y1) * (x2 - x1);
+        if (abs(cross) > 1e-6) return false;
+        
+        float dot = (px - x1) * (x2 - x1) + (py - y1) * (y2 - y1);
+        if (dot < 0) return false;
+        
+        float squaredLength = (x2 - x1)*(x2 - x1) + (y2 - y1)*(y2 - y1);
+        if (dot > squaredLength) return false;
+        
+        return true;
+    }
+    
+    // ==================== MÉTODOS DE CONSULTA Y CONTROL ====================
+    
+    Body2D* getBody(int bodyId) {
+        for (auto& body : bodies) {
+            if (body.id == bodyId) return &body;
+        }
+        return nullptr;
+    }
+    
+    void setVelocity(int bodyId, float vx, float vy) {
+        Body2D* body = getBody(bodyId);
+        if (body && !body->isStatic) {
+            body->vx = vx;
+            body->vy = vy;
+        }
+    }
+    
+    void applyForce(int bodyId, float fx, float fy) {
+        Body2D* body = getBody(bodyId);
+        if (body && !body->isStatic) {
+            body->ax += fx;
+            body->ay += fy;
+        }
+    }
+    
+    void setPosition(int bodyId, float x, float y) {
+        Body2D* body = getBody(bodyId);
+        if (body) {
+            body->x = x;
+            body->y = y;
+            if (body->type != "Circle") {
+                updateBodyVertices(*body);
+            }
+            updateGrid(bodyId);
+        }
+    }
+    
+    void setLayer(int bodyId, int layer, int mask) {
+        Body2D* body = getBody(bodyId);
+        if (body) {
+            body->layer = layer;
+            body->mask = mask;
+        }
+    }
+    
+    emscripten::val getBodyPosition(int bodyId) {
+        Body2D* body = getBody(bodyId);
+        if (!body) return emscripten::val::null();
+        
+        emscripten::val result = emscripten::val::object();
+        result.set("x", body->x);
+        result.set("y", body->y);
+        result.set("vx", body->vx);
+        result.set("vy", body->vy);
+        
+        return result;
+    }
+    
+    emscripten::val getCollisions() {
+        emscripten::val result = emscripten::val::array();
+        int index = 0;
+        
+        for (const auto& collision : collisions) {
+            emscripten::val col = emscripten::val::object();
+            col.set("bodyA", collision.bodyA);
+            col.set("bodyB", collision.bodyB);
+            col.set("overlap", collision.overlap);
+            col.set("normalX", collision.normalX);
+            col.set("normalY", collision.normalY);
+            col.set("contactX", collision.contactX);
+            col.set("contactY", collision.contactY);
+            
+            result.set(index++, col);
+        }
+        
+        return result;
+    }
+    
+    void removeBody(int bodyId) {
+        bodies.erase(
+            std::remove_if(bodies.begin(), bodies.end(),
+                [bodyId](const Body2D& body) { return body.id == bodyId; }),
+            bodies.end()
+        );
+        
+        // Remover del grid
+        for (auto& cell : grid) {
+            auto& bodiesInCell = cell.second;
+            bodiesInCell.erase(
+                std::remove(bodiesInCell.begin(), bodiesInCell.end(), bodyId),
+                bodiesInCell.end()
+            );
+        }
+    }
+    
+    void clear() {
+        bodies.clear();
+        collisions.clear();
+        grid.clear();
+        nextBodyId = 0;
+    }
+    
+    int getBodyCount() const { return bodies.size(); }
+    int getCollisionCount() const { return collisions.size(); }
+    
+    void setGravity(float gx, float gy) {
+        gravityX = gx;
+        gravityY = gy;
+    }
+    
+    void setContinuousDetection(bool enabled) {
+        enableContinuousDetection = enabled;
+    }
+};
+
+
+
+// ============================
+// 📦 Integración con Box2D - INTEGRADO
+// ============================
+
+class UltraBox2DIntegration {
+private:
+    struct Box2DBody {
+        int id;
+        void* body;
+        void* fixture;
+        std::string type;
+    };
+    
+    std::vector<Box2DBody> box2dBodies;
+    void* world;
+    float physicsScale;
+    int velocityIterations;
+    int positionIterations;
+    int nextBodyId;
+    
+public:
+    UltraBox2DIntegration(float gravityX = 0.0f, float gravityY = -9.81f, float scale = 1.0f) 
+        : physicsScale(scale), velocityIterations(8), positionIterations(3), nextBodyId(0) {
+        
+        // Crear mundo Box2D
+        #ifdef USE_BOX2D
+        b2Vec2 gravity(gravityX, gravityY);
+        world = new b2World(gravity);
+        #else
+        world = nullptr;
+        emscripten_console_warn("Box2D no está disponible. Compila con USE_BOX2D definido.");
+        #endif
+    }
+    
+    ~UltraBox2DIntegration() {
+        #ifdef USE_BOX2D
+        if (world) {
+            delete static_cast<b2World*>(world);
+        }
+        #endif
+    }
+    
+    int createDynamicBody(float x, float y, float width, float height) {
+        #ifdef USE_BOX2D
+        b2BodyDef bodyDef;
+        bodyDef.type = b2_dynamicBody;
+        bodyDef.position.Set(x / physicsScale, y / physicsScale);
+        b2Body* body = static_cast<b2World*>(world)->CreateBody(&bodyDef);
+        
+        b2PolygonShape shape;
+        shape.SetAsBox((width / 2) / physicsScale, (height / 2) / physicsScale);
+        
+        b2FixtureDef fixtureDef;
+        fixtureDef.shape = &shape;
+        fixtureDef.density = 1.0f;
+        fixtureDef.friction = 0.3f;
+        
+        b2Fixture* fixture = body->CreateFixture(&fixtureDef);
+        
+        Box2DBody box2dBody;
+        box2dBody.id = nextBodyId++;
+        box2dBody.body = body;
+        box2dBody.fixture = fixture;
+        box2dBody.type = "dynamic";
+        
+        box2dBodies.push_back(box2dBody);
+        return box2dBody.id;
+        #else
+        return -1;
+        #endif
+    }
+    
+    int createStaticBody(float x, float y, float width, float height) {
+        #ifdef USE_BOX2D
+        b2BodyDef bodyDef;
+        bodyDef.type = b2_staticBody;
+        bodyDef.position.Set(x / physicsScale, y / physicsScale);
+        b2Body* body = static_cast<b2World*>(world)->CreateBody(&bodyDef);
+        
+        b2PolygonShape shape;
+        shape.SetAsBox((width / 2) / physicsScale, (height / 2) / physicsScale);
+        
+        b2Fixture* fixture = body->CreateFixture(&shape, 0.0f);
+        
+        Box2DBody box2dBody;
+        box2dBody.id = nextBodyId++;
+        box2dBody.body = body;
+        box2dBody.fixture = fixture;
+        box2dBody.type = "static";
+        
+        box2dBodies.push_back(box2dBody);
+        return box2dBody.id;
+        #else
+        return -1;
+        #endif
+    }
+    
+    int createCircleBody(float x, float y, float radius) {
+        #ifdef USE_BOX2D
+        b2BodyDef bodyDef;
+        bodyDef.type = b2_dynamicBody;
+        bodyDef.position.Set(x / physicsScale, y / physicsScale);
+        b2Body* body = static_cast<b2World*>(world)->CreateBody(&bodyDef);
+        
+        b2CircleShape shape;
+        shape.m_radius = radius / physicsScale;
+        
+        b2FixtureDef fixtureDef;
+        fixtureDef.shape = &shape;
+        fixtureDef.density = 1.0f;
+        fixtureDef.friction = 0.3f;
+        
+        b2Fixture* fixture = body->CreateFixture(&fixtureDef);
+        
+        Box2DBody box2dBody;
+        box2dBody.id = nextBodyId++;
+        box2dBody.body = body;
+        box2dBody.fixture = fixture;
+        box2dBody.type = "circle";
+        
+        box2dBodies.push_back(box2dBody);
+        return box2dBody.id;
+        #else
+        return -1;
+        #endif
+    }
+    
+    void update(float dt) {
+        #ifdef USE_BOX2D
+        if (world) {
+            static_cast<b2World*>(world)->Step(dt, velocityIterations, positionIterations);
+        }
+        #endif
+    }
+    
+    void setVelocity(int bodyId, float vx, float vy) {
+        #ifdef USE_BOX2D
+        for (auto& box2dBody : box2dBodies) {
+            if (box2dBody.id == bodyId) {
+                b2Body* body = static_cast<b2Body*>(box2dBody.body);
+                body->SetLinearVelocity(b2Vec2(vx, vy));
+                break;
+            }
+        }
+        #endif
+    }
+    
+    void applyForce(int bodyId, float fx, float fy) {
+        #ifdef USE_BOX2D
+        for (auto& box2dBody : box2dBodies) {
+            if (box2dBody.id == bodyId) {
+                b2Body* body = static_cast<b2Body*>(box2dBody.body);
+                body->ApplyForceToCenter(b2Vec2(fx, fy), true);
+                break;
+            }
+        }
+        #endif
+    }
+    
+    void setPosition(int bodyId, float x, float y) {
+        #ifdef USE_BOX2D
+        for (auto& box2dBody : box2dBodies) {
+            if (box2dBody.id == bodyId) {
+                b2Body* body = static_cast<b2Body*>(box2dBody.body);
+                body->SetTransform(b2Vec2(x / physicsScale, y / physicsScale), body->GetAngle());
+                break;
+            }
+        }
+        #endif
+    }
+    
+    emscripten::val getBodyPosition(int bodyId) {
+        #ifdef USE_BOX2D
+        for (auto& box2dBody : box2dBodies) {
+            if (box2dBody.id == bodyId) {
+                b2Body* body = static_cast<b2Body*>(box2dBody.body);
+                b2Vec2 position = body->GetPosition();
+                b2Vec2 velocity = body->GetLinearVelocity();
+                
+                emscripten::val result = emscripten::val::object();
+                result.set("x", position.x * physicsScale);
+                result.set("y", position.y * physicsScale);
+                result.set("vx", velocity.x);
+                result.set("vy", velocity.y);
+                
+                return result;
+            }
+        }
+        #endif
+        return emscripten::val::null();
+    }
+    
+    void removeBody(int bodyId) {
+        #ifdef USE_BOX2D
+        for (auto it = box2dBodies.begin(); it != box2dBodies.end(); ) {
+            if (it->id == bodyId) {
+                b2Body* body = static_cast<b2Body*>(it->body);
+                static_cast<b2World*>(world)->DestroyBody(body);
+                it = box2dBodies.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        #endif
+    }
+    
+    void clear() {
+        #ifdef USE_BOX2D
+        for (auto& box2dBody : box2dBodies) {
+            b2Body* body = static_cast<b2Body*>(box2dBody.body);
+            static_cast<b2World*>(world)->DestroyBody(body);
+        }
+        box2dBodies.clear();
+        nextBodyId = 0;
+        #endif
+    }
+    
+    int getBodyCount() const { return box2dBodies.size(); }
+};
+
+// ============================
+// 🎮 Sistema de Escenas 2D - INTEGRADO
+// ============================
+
+class UltraScene2D {
+private:
+    struct SceneState {
+        std::string name;
+        bool isActive;
+        bool isLoaded;
+        std::function<void()> onPreload;
+        std::function<void()> onCreate;
+        std::function<void(float)> onUpdate;
+        std::function<void()> onRender;
+        std::function<void()> onDestroy;
+        std::function<void()> onPause;
+        std::function<void()> onResume;
+        
+        emscripten::val userData;
+        
+        SceneState() : isActive(false), isLoaded(false) {
+            userData = emscripten::val::object();
+        }
+    };
+    
+    std::unordered_map<std::string, SceneState> scenes;
+    std::vector<std::string> sceneStack;
+    std::string currentScene;
+    bool isPaused;
+    
+public:
+    UltraScene2D() : isPaused(false) {}
+    
+    void registerScene(const std::string& sceneName,
+                      std::function<void()> preload = nullptr,
+                      std::function<void()> create = nullptr,
+                      std::function<void(float)> update = nullptr,
+                      std::function<void()> render = nullptr,
+                      std::function<void()> destroy = nullptr,
+                      std::function<void()> pause = nullptr,
+                      std::function<void()> resume = nullptr) {
+        
+        SceneState scene;
+        scene.name = sceneName;
+        scene.onPreload = preload;
+        scene.onCreate = create;
+        scene.onUpdate = update;
+        scene.onRender = render;
+        scene.onDestroy = destroy;
+        scene.onPause = pause;
+        scene.onResume = resume;
+        
+        scenes[sceneName] = scene;
+    }
+    
+    void startScene(const std::string& sceneName) {
+        if (scenes.find(sceneName) == scenes.end()) {
+            emscripten_console_error(("Scene not found: " + sceneName).c_str());
+            return;
+        }
+        
+        // Detener escena actual si existe
+        if (!currentScene.empty()) {
+            stopCurrentScene();
+        }
+        
+        currentScene = sceneName;
+        SceneState& scene = scenes[sceneName];
+        
+        // Precarga
+        if (!scene.isLoaded && scene.onPreload) {
+            scene.onPreload();
+        }
+        
+        // Creación
+        if (scene.onCreate) {
+            scene.onCreate();
+        }
+        
+        scene.isLoaded = true;
+        scene.isActive = true;
+        
+        emscripten_console_log(("🎬 Scene started: " + sceneName).c_str());
+    }
+    
+    void pushScene(const std::string& sceneName) {
+        if (scenes.find(sceneName) == scenes.end()) {
+            emscripten_console_error(("Scene not found: " + sceneName).c_str());
+            return;
+        }
+        
+        // Pausar escena actual
+        if (!currentScene.empty()) {
+            SceneState& current = scenes[currentScene];
+            if (current.onPause) {
+                current.onPause();
+            }
+            current.isActive = false;
+        }
+        
+        sceneStack.push_back(currentScene);
+        currentScene = sceneName;
+        SceneState& scene = scenes[sceneName];
+        
+        // Precarga si es necesario
+        if (!scene.isLoaded && scene.onPreload) {
+            scene.onPreload();
+        }
+        
+        // Creación o reanudación
+        if (scene.isLoaded && scene.onResume) {
+            scene.onResume();
+        } else if (scene.onCreate) {
+            scene.onCreate();
+        }
+        
+        scene.isLoaded = true;
+        scene.isActive = true;
+    }
+    
+    void popScene() {
+        if (sceneStack.empty()) return;
+        
+        // Destruir escena actual
+        if (!currentScene.empty()) {
+            SceneState& current = scenes[currentScene];
+            if (current.onDestroy) {
+                current.onDestroy();
+            }
+            current.isLoaded = false;
+            current.isActive = false;
+        }
+        
+        currentScene = sceneStack.back();
+        sceneStack.pop_back();
+        
+        if (!currentScene.empty()) {
+            SceneState& scene = scenes[currentScene];
+            if (scene.onResume) {
+                scene.onResume();
+            }
+            scene.isActive = true;
+        }
+    }
+    
+    void stopCurrentScene() {
+        if (currentScene.empty()) return;
+        
+        SceneState& scene = scenes[currentScene];
+        if (scene.onDestroy) {
+            scene.onDestroy();
+        }
+        
+        scene.isLoaded = false;
+        scene.isActive = false;
+        currentScene.clear();
+    }
+    
+    void update(float dt) {
+        if (currentScene.empty() || isPaused) return;
+        
+        SceneState& scene = scenes[currentScene];
+        if (scene.isActive && scene.onUpdate) {
+            scene.onUpdate(dt);
+        }
+    }
+    
+    void render() {
+        if (currentScene.empty()) return;
+        
+        SceneState& scene = scenes[currentScene];
+        if (scene.isActive && scene.onRender) {
+            scene.onRender();
+        }
+    }
+    
+    void pause() {
+        if (isPaused || currentScene.empty()) return;
+        
+        SceneState& scene = scenes[currentScene];
+        if (scene.onPause) {
+            scene.onPause();
+        }
+        
+        isPaused = true;
+    }
+    
+    void resume() {
+        if (!isPaused || currentScene.empty()) return;
+        
+        SceneState& scene = scenes[currentScene];
+        if (scene.onResume) {
+            scene.onResume();
+        }
+        
+        isPaused = false;
+    }
+    
+    emscripten::val getCurrentScene() {
+        if (currentScene.empty()) return emscripten::val::null();
+        return emscripten::val(currentScene);
+    }
+    
+    emscripten::val getSceneStack() {
+        emscripten::val result = emscripten::val::array();
+        for (size_t i = 0; i < sceneStack.size(); i++) {
+            result.set(i, sceneStack[i]);
+        }
+        return result;
+    }
+    
+    void setSceneUserData(const std::string& sceneName, const std::string& key, emscripten::val value) {
+        if (scenes.find(sceneName) != scenes.end()) {
+            scenes[sceneName].userData.set(key, value);
+        }
+    }
+    
+    emscripten::val getSceneUserData(const std::string& sceneName, const std::string& key) {
+        if (scenes.find(sceneName) != scenes.end()) {
+            return scenes[sceneName].userData[key];
+        }
+        return emscripten::val::null();
+    }
+};
+
+// ============================
+// 📷 Cámara 2D Avanzada - INTEGRADO
+// ============================
+
+class UltraCamera2D {
+private:
+    struct CameraState {
+        float x, y;
+        float zoom;
+        float rotation;
+        float viewportWidth, viewportHeight;
+        float worldWidth, worldHeight;
+        float deadZoneX, deadZoneY;
+        float deadZoneWidth, deadZoneHeight;
+        std::string followTarget;
+        float followSpeed;
+        bool boundsEnabled;
+        float minX, minY, maxX, maxY;
+        float shakeIntensity;
+        float shakeDuration;
+        float shakeTimer;
+        
+        CameraState() : x(0), y(0), zoom(1.0f), rotation(0), 
+                       viewportWidth(800), viewportHeight(600),
+                       worldWidth(1000), worldHeight(1000),
+                       deadZoneX(0), deadZoneY(0), deadZoneWidth(100), deadZoneHeight(100),
+                       followSpeed(5.0f), boundsEnabled(false),
+                       minX(0), minY(0), maxX(1000), maxY(1000),
+                       shakeIntensity(0), shakeDuration(0), shakeTimer(0) {}
+    };
+    
+    CameraState state;
+    float shakeSeed;
+    
+public:
+    UltraCamera2D(float viewportWidth = 800.0f, float viewportHeight = 600.0f) 
+        : shakeSeed(0.0f) {
+        state.viewportWidth = viewportWidth;
+        state.viewportHeight = viewportHeight;
+    }
+    
+    void setPosition(float x, float y) {
+        state.x = x;
+        state.y = y;
+        applyBounds();
+    }
+    
+    void setZoom(float zoom) {
+        state.zoom = std::max(0.1f, zoom);
+    }
+    
+    void setRotation(float rotation) {
+        state.rotation = rotation;
+    }
+    
+    void setFollowTarget(const std::string& targetId, float speed = 5.0f) {
+        state.followTarget = targetId;
+        state.followSpeed = speed;
+    }
+    
+    void setDeadZone(float x, float y, float width, float height) {
+        state.deadZoneX = x;
+        state.deadZoneY = y;
+        state.deadZoneWidth = width;
+        state.deadZoneHeight = height;
+    }
+    
+    void setBounds(float minX, float minY, float maxX, float maxY) {
+        state.boundsEnabled = true;
+        state.minX = minX;
+        state.minY = minY;
+        state.maxX = maxX;
+        state.maxY = maxY;
+    }
+    
+    void shake(float intensity, float duration) {
+        state.shakeIntensity = intensity;
+        state.shakeDuration = duration;
+        state.shakeTimer = duration;
+    }
+    
+    void update(float dt, emscripten::val targetData = emscripten::val::null()) {
+        // Seguir objetivo
+        if (!state.followTarget.empty() && !targetData.isNull()) {
+            float targetX = targetData["x"].as<float>();
+            float targetY = targetData["y"].as<float>();
+            
+            // Calcular posición dentro de la dead zone
+            float cameraLeft = state.x - (state.viewportWidth / state.zoom / 2);
+            float cameraRight = state.x + (state.viewportWidth / state.zoom / 2);
+            float cameraTop = state.y - (state.viewportHeight / state.zoom / 2);
+            float cameraBottom = state.y + (state.viewportHeight / state.zoom / 2);
+            
+            float deadZoneLeft = cameraLeft + state.deadZoneX;
+            float deadZoneRight = cameraLeft + state.deadZoneX + state.deadZoneWidth;
+            float deadZoneTop = cameraTop + state.deadZoneY;
+            float deadZoneBottom = cameraTop + state.deadZoneY + state.deadZoneHeight;
+            
+            if (targetX < deadZoneLeft) {
+                state.x -= (deadZoneLeft - targetX);
+            } else if (targetX > deadZoneRight) {
+                state.x += (targetX - deadZoneRight);
+            }
+            
+            if (targetY < deadZoneTop) {
+                state.y -= (deadZoneTop - targetY);
+            } else if (targetY > deadZoneBottom) {
+                state.y += (targetY - deadZoneBottom);
+            }
+            
+            // Suavizado
+            float dx = state.x - targetX;
+            float dy = state.y - targetY;
+            state.x -= dx * state.followSpeed * dt;
+            state.y -= dy * state.followSpeed * dt;
+        }
+        
+        // Aplicar límites
+        applyBounds();
+        
+        // Actualizar shake
+        if (state.shakeTimer > 0) {
+            state.shakeTimer -= dt;
+            shakeSeed += dt * 30.0f;
+        }
+    }
+    
+    void applyBounds() {
+        if (!state.boundsEnabled) return;
+        
+        float halfViewportWidth = (state.viewportWidth / state.zoom) / 2;
+        float halfViewportHeight = (state.viewportHeight / state.zoom) / 2;
+        
+        state.x = std::max(state.minX + halfViewportWidth, std::min(state.maxX - halfViewportWidth, state.x));
+        state.y = std::max(state.minY + halfViewportHeight, std::min(state.maxY - halfViewportHeight, state.y));
+    }
+    
+    emscripten::val worldToScreen(float worldX, float worldY) {
+        // Aplicar transformaciones de cámara
+        float screenX = (worldX - state.x) * state.zoom + state.viewportWidth / 2;
+        float screenY = (worldY - state.y) * state.zoom + state.viewportHeight / 2;
+        
+        // Aplicar rotación (alrededor del centro de la pantalla)
+        float centerX = state.viewportWidth / 2;
+        float centerY = state.viewportHeight / 2;
+        
+        screenX -= centerX;
+        screenY -= centerY;
+        
+        float cosAngle = cos(-state.rotation);
+        float sinAngle = sin(-state.rotation);
+        
+        float rotatedX = screenX * cosAngle - screenY * sinAngle;
+        float rotatedY = screenX * sinAngle + screenY * cosAngle;
+        
+        screenX = rotatedX + centerX;
+        screenY = rotatedY + centerY;
+        
+        // Aplicar shake
+        if (state.shakeTimer > 0) {
+            float progress = state.shakeTimer / state.shakeDuration;
+            float currentIntensity = state.shakeIntensity * progress;
+            
+            screenX += (sin(shakeSeed * 13.7f) * currentIntensity);
+            screenY += (cos(shakeSeed * 11.3f) * currentIntensity);
+        }
+        
+        emscripten::val result = emscripten::val::object();
+        result.set("x", screenX);
+        result.set("y", screenY);
+        
+        return result;
+    }
+    
+    emscripten::val screenToWorld(float screenX, float screenY) {
+        // Aplicar transformaciones inversas
+        
+        // Quitar shake (aproximado)
+        if (state.shakeTimer > 0) {
+            float progress = state.shakeTimer / state.shakeDuration;
+            float currentIntensity = state.shakeIntensity * progress;
+            
+            screenX -= (sin(shakeSeed * 13.7f) * currentIntensity);
+            screenY -= (cos(shakeSeed * 11.3f) * currentIntensity);
+        }
+        
+        // Rotación inversa
+        float centerX = state.viewportWidth / 2;
+        float centerY = state.viewportHeight / 2;
+        
+        screenX -= centerX;
+        screenY -= centerY;
+        
+        float cosAngle = cos(state.rotation);
+        float sinAngle = sin(state.rotation);
+        
+        float rotatedX = screenX * cosAngle - screenY * sinAngle;
+        float rotatedY = screenX * sinAngle + screenY * cosAngle;
+        
+        screenX = rotatedX + centerX;
+        screenY = rotatedY + centerY;
+        
+        // Transformación inversa de cámara
+        float worldX = (screenX - state.viewportWidth / 2) / state.zoom + state.x;
+        float worldY = (screenY - state.viewportHeight / 2) / state.zoom + state.y;
+        
+        emscripten::val result = emscripten::val::object();
+        result.set("x", worldX);
+        result.set("y", worldY);
+        
+        return result;
+    }
+    
+    emscripten::val getViewMatrix() {
+        // Matriz de vista 2D (para shaders)
+        float viewMatrix[16] = {0};
+        
+        // Escala (zoom)
+        viewMatrix[0] = state.zoom;
+        viewMatrix[5] = state.zoom;
+        viewMatrix[10] = 1.0f;
+        viewMatrix[15] = 1.0f;
+        
+        // Rotación
+        float cosAngle = cos(state.rotation);
+        float sinAngle = sin(state.rotation);
+        
+        float rotationMatrix[16] = {
+            cosAngle, -sinAngle, 0, 0,
+            sinAngle, cosAngle, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        };
+        
+        // Traslación
+        float translationMatrix[16] = {
+            1, 0, 0, -state.x,
+            0, 1, 0, -state.y,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        };
+        
+        // Combinar matrices (en orden correcto)
+        // Para simplificar, devolvemos una matriz identidad
+        // En producción, se multiplicarían las matrices
+        
+        return emscripten::val::array(std::vector<float>(viewMatrix, viewMatrix + 16));
+    }
+    
+    emscripten::val getCameraData() {
+        emscripten::val result = emscripten::val::object();
+        result.set("x", state.x);
+        result.set("y", state.y);
+        result.set("zoom", state.zoom);
+        result.set("rotation", state.rotation);
+        result.set("viewportWidth", state.viewportWidth);
+        result.set("viewportHeight", state.viewportHeight);
+        result.set("isShaking", state.shakeTimer > 0);
+        result.set("shakeProgress", state.shakeTimer / state.shakeDuration);
+        
+        return result;
+    }
+    
+    void setViewportSize(float width, float height) {
+        state.viewportWidth = width;
+        state.viewportHeight = height;
+    }
+};
+// ============================
+// 📦 ULTRA ENHANCED ASSET MANAGER (2D/3D UNIFICADO)
+// ============================
+
+class UltraEnhancedAssetManager {
+private:
+    // ==================== ESTRUCTURAS DE DATOS ====================
+    struct EnhancedAsset {
+        std::string id;
+        std::string type; // "texture", "audio", "json", "font", "shader", "mesh", "material"
+        std::string path;
+        std::string bundle;
+        emscripten::val data;
+        bool loaded;
+        bool loading;
+        float progress;
+        size_t size;
+        int references;
+        time_t lastModified;
+        std::vector<std::string> dependencies;
+        std::vector<std::function<void(emscripten::val)>> callbacks;
+        std::unordered_map<std::string, emscripten::val> metadata;
+        
+        EnhancedAsset() : loaded(false), loading(false), progress(0.0f), 
+                         size(0), references(0), lastModified(0) {
+            data = emscripten::val::object();
+        }
+    };
+    
+    struct AssetBundle {
+        std::string name;
+        std::vector<std::string> assets;
+        size_t totalSize;
+        bool loaded;
+        float progress;
+        std::string compression;
+        std::string targetPlatform; // "web", "mobile", "desktop"
+        
+        AssetBundle() : totalSize(0), loaded(false), progress(0.0f), compression("none") {}
+    };
+    
+    struct LoadRequest {
+        std::string assetId;
+        std::string type;
+        std::string path;
+        std::function<void(emscripten::val)> onLoad;
+        std::function<void(float)> onProgress;
+        std::function<void(std::string)> onError;
+        int priority; // 0=low, 1=normal, 2=high
+        bool preload; // Cargar en segundo plano
+    };
+    
+    // ==================== VARIABLES MIEMBRO ====================
+    std::unordered_map<std::string, EnhancedAsset> assets;
+    std::unordered_map<std::string, AssetBundle> bundles;
+    std::unordered_map<std::string, std::vector<std::function<void(emscripten::val)>>> loadCallbacks;
+    std::unordered_map<std::string, std::vector<std::function<void(emscripten::val)>>> hotReloadCallbacks;
+    
+    // Sistema de colas con prioridad
+    std::vector<LoadRequest> loadQueue;
+    std::vector<LoadRequest> highPriorityQueue;
+    
+    // Estadísticas y configuración
+    size_t maxMemoryUsage;
+    size_t currentMemoryUsage;
+    bool enableHotReloading;
+    bool enableCompression;
+    bool enableCache;
+    int maxConcurrentLoads;
+    int currentLoads;
+    std::string defaultCompressionFormat;
+    
+    // Cache de assets
+    std::unordered_map<std::string, std::string> assetCache;
+    size_t cacheSize;
+    size_t maxCacheSize;
+
+public:
+    // ==================== CONSTRUCTOR/DESTRUCTOR ====================
+    UltraEnhancedAssetManager(size_t maxMemory = 512 * 1024 * 1024, 
+                            size_t maxCache = 256 * 1024 * 1024) {
+        maxMemoryUsage = maxMemory;
+        maxCacheSize = maxCache;
+        currentMemoryUsage = 0;
+        cacheSize = 0;
+        enableHotReloading = true;
+        enableCompression = true;
+        enableCache = true;
+        maxConcurrentLoads = 6; // Aumentado para mejor rendimiento
+        currentLoads = 0;
+        defaultCompressionFormat = "webp";
+        
+        emscripten_console_log("✅ UltraEnhancedAssetManager inicializado (2D/3D)");
+    }
+    
+    ~UltraEnhancedAssetManager() {
+        clearAllAssets();
+        emscripten_console_log("🗑️ UltraEnhancedAssetManager destruido");
+    }
+
+    // ==================== MÉTODOS DE CARGA DE ASSETS ====================
+    
+    // Texturas (2D/3D)
+    void loadTexture(const std::string& assetId, const std::string& path,
+                    std::function<void(emscripten::val)> callback = nullptr,
+                    const std::string& bundle = "",
+                    int priority = 1) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "texture";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // SpriteSheets (2D)
+    void loadSpriteSheet(const std::string& assetId, 
+                        const std::string& texturePath,
+                        const std::string& jsonPath,
+                        std::function<void(emscripten::val)> callback = nullptr,
+                        const std::string& bundle = "",
+                        int priority = 1) {
+        // Primero cargar la textura
+        loadTexture(texturePath + "_texture", texturePath, nullptr, bundle, 0);
+        
+        // Luego el JSON del spritesheet
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "spritesheet";
+        request.path = jsonPath;
+        request.onLoad = [this, assetId, texturePath, callback](emscripten::val jsonData) {
+            // Combinar textura y datos del spritesheet
+            emscripten::val combinedData = emscripten::val::object();
+            combinedData.set("texture", texturePath + "_texture");
+            combinedData.set("frames", jsonData["frames"]);
+            combinedData.set("meta", jsonData["meta"]);
+            
+            // Almacenar asset combinado
+            auto it = assets.find(assetId);
+            if (it != assets.end()) {
+                it->second.data = combinedData;
+                it->second.loaded = true;
+                it->second.progress = 1.0f;
+                
+                // Llamar callback
+                if (callback) {
+                    callback(combinedData);
+                }
+                
+                // Llamar callbacks registrados
+                auto cbIt = loadCallbacks.find(assetId);
+                if (cbIt != loadCallbacks.end()) {
+                    for (auto& cb : cbIt->second) {
+                        cb(combinedData);
+                    }
+                    loadCallbacks.erase(cbIt);
+                }
+            }
+        };
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Audio (2D/3D)
+    void loadAudio(const std::string& assetId, const std::string& path,
+                  std::function<void(emscripten::val)> callback = nullptr,
+                  const std::string& bundle = "",
+                  int priority = 1,
+                  bool stream = false) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = stream ? "audio_stream" : "audio";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Modelos 3D
+    void loadModel(const std::string& assetId, const std::string& path,
+                  std::function<void(emscripten::val)> callback = nullptr,
+                  const std::string& bundle = "",
+                  int priority = 1) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "model";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Materiales (3D)
+    void loadMaterial(const std::string& assetId, const std::string& path,
+                     std::function<void(emscripten::val)> callback = nullptr,
+                     const std::string& bundle = "",
+                     int priority = 1) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "material";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Shaders (2D/3D)
+    void loadShader(const std::string& assetId, const std::string& path,
+                   std::function<void(emscripten::val)> callback = nullptr,
+                   const std::string& bundle = "",
+                   int priority = 2) { // Alta prioridad para shaders
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "shader";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Fuentes (2D/3D)
+    void loadFont(const std::string& assetId, const std::string& path,
+                 std::function<void(emscripten::val)> callback = nullptr,
+                 const std::string& bundle = "",
+                 int priority = 1) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "font";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // JSON/Config (2D/3D)
+    void loadJSON(const std::string& assetId, const std::string& path,
+                 std::function<void(emscripten::val)> callback = nullptr,
+                 const std::string& bundle = "",
+                 int priority = 1) {
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "json";
+        request.path = path;
+        request.onLoad = callback;
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+    
+    // Cubemaps (3D)
+    void loadCubemap(const std::string& assetId, 
+                    const std::vector<std::string>& facePaths,
+                    std::function<void(emscripten::val)> callback = nullptr,
+                    const std::string& bundle = "",
+                    int priority = 1) {
+        // Cargar cada cara del cubemap
+        for (size_t i = 0; i < facePaths.size(); i++) {
+            std::string faceId = assetId + "_face_" + std::to_string(i);
+            loadTexture(faceId, facePaths[i], nullptr, bundle, 0);
+        }
+        
+        // Crear asset de cubemap combinado
+        LoadRequest request;
+        request.assetId = assetId;
+        request.type = "cubemap";
+        request.path = "generated";
+        request.onLoad = [this, assetId, facePaths, callback](emscripten::val data) {
+            emscripten::val cubemapData = emscripten::val::object();
+            emscripten::val faces = emscripten::val::array();
+            
+            for (size_t i = 0; i < facePaths.size(); i++) {
+                faces.set(i, assetId + "_face_" + std::to_string(i));
+            }
+            
+            cubemapData.set("faces", faces);
+            cubemapData.set("type", "cubemap");
+            
+            auto it = assets.find(assetId);
+            if (it != assets.end()) {
+                it->second.data = cubemapData;
+                it->second.loaded = true;
+                
+                if (callback) {
+                    callback(cubemapData);
+                }
+            }
+        };
+        request.priority = priority;
+        request.preload = false;
+        
+        queueLoadRequest(request, bundle);
+    }
+
+    // ==================== GESTIÓN DE COLAS ====================
+    
+    void queueLoadRequest(const LoadRequest& request, const std::string& bundle = "") {
+        // Verificar si ya está cargado
+        auto assetIt = assets.find(request.assetId);
+        if (assetIt != assets.end() && assetIt->second.loaded) {
+            if (request.onLoad) {
+                request.onLoad(assetIt->second.data);
+            }
+            return;
+        }
+        
+        // Crear o actualizar asset
+        EnhancedAsset asset;
+        asset.id = request.assetId;
+        asset.type = request.type;
+        asset.path = request.path;
+        asset.bundle = bundle;
+        asset.loading = false;
+        asset.loaded = false;
+        asset.progress = 0.0f;
+        
+        assets[request.assetId] = asset;
+        
+        // Registrar callback si existe
+        if (request.onLoad) {
+            loadCallbacks[request.assetId].push_back(request.onLoad);
+        }
+        
+        // Agregar a cola según prioridad
+        if (request.priority == 2) {
+            highPriorityQueue.push_back(request);
+        } else {
+            loadQueue.push_back(request);
+        }
+        
+        // Procesar colas
+        processLoadQueues();
+    }
+    
+    void processLoadQueues() {
+        // Procesar cola de alta prioridad primero
+        while (currentLoads < maxConcurrentLoads && !highPriorityQueue.empty()) {
+            LoadRequest request = highPriorityQueue.front();
+            highPriorityQueue.erase(highPriorityQueue.begin());
+            
+            startAssetLoad(request);
+            currentLoads++;
+        }
+        
+        // Procesar cola normal
+        while (currentLoads < maxConcurrentLoads && !loadQueue.empty()) {
+            LoadRequest request = loadQueue.front();
+            loadQueue.erase(loadQueue.begin());
+            
+            startAssetLoad(request);
+            currentLoads++;
+        }
+    }
+    
+    void startAssetLoad(const LoadRequest& request) {
+        auto it = assets.find(request.assetId);
+        if (it == assets.end()) {
+            currentLoads--;
+            return;
+        }
+        
+        EnhancedAsset& asset = it->second;
+        asset.loading = true;
+        asset.progress = 0.0f;
+        
+        // Simular carga asíncrona (en producción usaríamos Fetch API)
+        simulateAssetLoad(request, asset);
+    }
+    
+    void simulateAssetLoad(const LoadRequest& request, EnhancedAsset& asset) {
+        // Simular progreso de carga
+        for (int progress = 0; progress <= 100; progress += 10) {
+            asset.progress = progress / 100.0f;
+            
+            // Llamar callback de progreso si existe
+            if (request.onProgress) {
+                request.onProgress(asset.progress);
+            }
+        }
+        
+        // Simular carga completada
+        asset.loaded = true;
+        asset.loading = false;
+        asset.progress = 1.0f;
+        asset.lastModified = time(nullptr);
+        
+        // Generar datos simulados según el tipo
+        generateSimulatedAssetData(asset);
+        
+        // Actualizar uso de memoria
+        currentMemoryUsage += asset.size;
+        
+        // Llamar callbacks
+        auto cbIt = loadCallbacks.find(request.assetId);
+        if (cbIt != loadCallbacks.end()) {
+            for (auto& callback : cbIt->second) {
+                callback(asset.data);
+            }
+            loadCallbacks.erase(cbIt);
+        }
+        
+        // Llamar callback original si existe
+        if (request.onLoad) {
+            request.onLoad(asset.data);
+        }
+        
+        // Hot reloading
+        if (enableHotReloading) {
+            auto hotReloadIt = hotReloadCallbacks.find(request.assetId);
+            if (hotReloadIt != hotReloadCallbacks.end()) {
+                for (auto& callback : hotReloadIt->second) {
+                    callback(asset.data);
+                }
+            }
+        }
+        
+        currentLoads--;
+        processLoadQueues(); // Procesar siguiente en cola
+        
+        emscripten_console_log(("✅ Asset loaded: " + request.assetId + " (" + request.type + ")").c_str());
+    }
+    
+    void generateSimulatedAssetData(EnhancedAsset& asset) {
+        if (asset.type == "texture") {
+            asset.data = emscripten::val::object();
+            asset.data.set("width", 512);
+            asset.data.set("height", 512);
+            asset.data.set("format", "RGBA");
+            asset.data.set("channels", 4);
+            asset.data.set("mipmaps", true);
+            asset.size = 512 * 512 * 4;
+            
+        } else if (asset.type == "spritesheet") {
+            asset.data = emscripten::val::object();
+            asset.data.set("texture", asset.path + "_texture");
+            
+            emscripten::val frames = emscripten::val::object();
+            for (int i = 0; i < 16; i++) {
+                emscripten::val frame = emscripten::val::object();
+                frame.set("x", (i % 4) * 64);
+                frame.set("y", (i / 4) * 64);
+                frame.set("width", 64);
+                frame.set("height", 64);
+                frames.set(("frame" + std::to_string(i)).c_str(), frame);
+            }
+            asset.data.set("frames", frames);
+            asset.size = 1024 * 4;
+            
+        } else if (asset.type == "audio" || asset.type == "audio_stream") {
+            asset.data = emscripten::val::object();
+            asset.data.set("duration", 30.0f);
+            asset.data.set("sampleRate", 44100);
+            asset.data.set("channels", 2);
+            asset.data.set("streaming", asset.type == "audio_stream");
+            asset.size = 44100 * 30 * 2 * 2; // 30 segundos stereo 16-bit
+            
+        } else if (asset.type == "model") {
+            asset.data = emscripten::val::object();
+            asset.data.set("vertices", 1500);
+            asset.data.set("triangles", 500);
+            asset.data.set("materials", 3);
+            asset.data.set("animations", 2);
+            asset.size = 1500 * 3 * 4 * 8; // vértices * posición/normal/uv * float * bytes
+            
+        } else if (asset.type == "material") {
+            asset.data = emscripten::val::object();
+            asset.data.set("shader", "pbr_basic");
+            asset.data.set("albedo", emscripten::val::array(std::vector<float>{1.0f, 1.0f, 1.0f}));
+            asset.data.set("roughness", 0.5f);
+            asset.data.set("metalness", 0.0f);
+            asset.size = 1024;
+            
+        } else if (asset.type == "shader") {
+            asset.data = emscripten::val::object();
+            asset.data.set("vertexShader", "// vertex shader code");
+            asset.data.set("fragmentShader", "// fragment shader code");
+            asset.data.set("uniforms", emscripten::val::array());
+            asset.size = 2048;
+            
+        } else if (asset.type == "font") {
+            asset.data = emscripten::val::object();
+            asset.data.set("family", "Arial");
+            asset.data.set("size", 16);
+            asset.data.set("glyphs", 256);
+            asset.size = 256 * 64; // 256 glifos, 64 bytes cada uno
+            
+        } else if (asset.type == "json") {
+            asset.data = emscripten::val::object();
+            asset.data.set("loaded", true);
+            asset.data.set("type", "configuration");
+            asset.size = 512;
+            
+        } else if (asset.type == "cubemap") {
+            asset.data = emscripten::val::object();
+            emscripten::val faces = emscripten::val::array();
+            for (int i = 0; i < 6; i++) {
+                faces.set(i, asset.id + "_face_" + std::to_string(i));
+            }
+            asset.data.set("faces", faces);
+            asset.data.set("type", "cubemap");
+            asset.size = 512 * 512 * 4 * 6; // 6 caras de 512x512 RGBA
+        }
+    }
+
+    // ==================== GESTIÓN DE BUNDLES ====================
+    
+    void createBundle(const std::string& bundleName, emscripten::val assetList) {
+        AssetBundle bundle;
+        bundle.name = bundleName;
+        
+        int length = assetList["length"].as<int>();
+        for (int i = 0; i < length; i++) {
+            std::string assetId = assetList[i].as<std::string>();
+            bundle.assets.push_back(assetId);
+            
+            // Calcular tamaño total
+            if (assets.find(assetId) != assets.end()) {
+                bundle.totalSize += assets[assetId].size;
+            }
+        }
+        
+        bundles[bundleName] = bundle;
+        emscripten_console_log(("📦 Bundle created: " + bundleName + " with " + std::to_string(length) + " assets").c_str());
+    }
+    
+    void loadBundle(const std::string& bundleName, std::function<void()> callback = nullptr) {
+        auto it = bundles.find(bundleName);
+        if (it == bundles.end()) {
+            emscripten_console_error(("Bundle not found: " + bundleName).c_str());
+            if (callback) callback();
+            return;
+        }
+        
+        AssetBundle& bundle = it->second;
+        int assetsToLoad = 0;
+        int assetsLoaded = 0;
+        
+        for (const std::string& assetId : bundle.assets) {
+            if (assets.find(assetId) != assets.end() && !assets[assetId].loaded) {
+                assetsToLoad++;
+                
+                // Registrar callback para contar carga
+                loadCallbacks[assetId].push_back([this, &assetsLoaded, assetsToLoad, callback](emscripten::val) {
+                    assetsLoaded++;
+                    if (assetsLoaded >= assetsToLoad && callback) {
+                        callback();
+                    }
+                });
+                
+                // Forzar carga
+                if (assets[assetId].loading) continue;
+                
+                LoadRequest request;
+                request.assetId = assetId;
+                request.type = assets[assetId].type;
+                request.path = assets[assetId].path;
+                request.priority = 0; // Baja prioridad para bundles
+                request.preload = true;
+                
+                queueLoadRequest(request);
+            }
+        }
+        
+        if (assetsToLoad == 0 && callback) {
+            callback();
+        }
+        
+        bundle.loaded = (assetsToLoad == 0);
+    }
+    
+    void unloadBundle(const std::string& bundleName) {
+        auto it = bundles.find(bundleName);
+        if (it == bundles.end()) return;
+        
+        for (const std::string& assetId : it->second.assets) {
+            unloadAsset(assetId);
+        }
+        
+        emscripten_console_log(("📦 Bundle unloaded: " + bundleName).c_str());
+    }
+    
+    emscripten::val getBundleInfo(const std::string& bundleName) {
+        auto it = bundles.find(bundleName);
+        if (it == bundles.end()) return emscripten::val::null();
+        
+        auto& bundle = it->second;
+        emscripten::val result = emscripten::val::object();
+        result.set("name", bundle.name);
+        result.set("totalSize", bundle.totalSize);
+        result.set("loaded", bundle.loaded);
+        result.set("progress", bundle.progress);
+        result.set("assetCount", static_cast<int>(bundle.assets.size()));
+        result.set("compression", bundle.compression);
+        
+        // Calcular progreso actual
+        int loadedAssets = 0;
+        for (const auto& assetId : bundle.assets) {
+            if (assets.find(assetId) != assets.end() && assets[assetId].loaded) {
+                loadedAssets++;
+            }
+        }
+        
+        bundle.progress = bundle.assets.empty() ? 1.0f : (loadedAssets / static_cast<float>(bundle.assets.size()));
+        result.set("loadedAssets", loadedAssets);
+        result.set("progress", bundle.progress);
+        
+        return result;
+    }
+
+    // ==================== MÉTODOS DE CONSULTA ====================
+    
+    emscripten::val getAsset(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it == assets.end() || !it->second.loaded) {
+            return emscripten::val::null();
+        }
+        return it->second.data;
+    }
+    
+    bool isAssetLoaded(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        return it != assets.end() && it->second.loaded;
+    }
+    
+    float getAssetProgress(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it == assets.end()) return 0.0f;
+        return it->second.progress;
+    }
+    
+    emscripten::val getAssetInfo(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it == assets.end()) return emscripten::val::null();
+        
+        auto& asset = it->second;
+        emscripten::val info = emscripten::val::object();
+        info.set("id", asset.id);
+        info.set("type", asset.type);
+        info.set("path", asset.path);
+        info.set("loaded", asset.loaded);
+        info.set("loading", asset.loading);
+        info.set("progress", asset.progress);
+        info.set("size", asset.size);
+        info.set("bundle", asset.bundle);
+        info.set("references", asset.references);
+        info.set("lastModified", static_cast<int>(asset.lastModified));
+        info.set("dependencies", emscripten::val::array(asset.dependencies));
+        
+        return info;
+    }
+    
+    emscripten::val getAllAssets() {
+        emscripten::val result = emscripten::val::array();
+        int index = 0;
+        
+        for (const auto& [id, asset] : assets) {
+            emscripten::val assetInfo = emscripten::val::object();
+            assetInfo.set("id", asset.id);
+            assetInfo.set("type", asset.type);
+            assetInfo.set("loaded", asset.loaded);
+            assetInfo.set("progress", asset.progress);
+            assetInfo.set("size", asset.size);
+            assetInfo.set("references", asset.references);
+            
+            result.set(index++, assetInfo);
+        }
+        
+        return result;
+    }
+    
+    emscripten::val getAllBundles() {
+        emscripten::val result = emscripten::val::array();
+        int index = 0;
+        
+        for (const auto& [name, bundle] : bundles) {
+            emscripten::val bundleInfo = emscripten::val::object();
+            bundleInfo.set("name", name);
+            bundleInfo.set("totalSize", bundle.totalSize);
+            bundleInfo.set("loaded", bundle.loaded);
+            bundleInfo.set("progress", bundle.progress);
+            bundleInfo.set("assetCount", static_cast<int>(bundle.assets.size()));
+            
+            result.set(index++, bundleInfo);
+        }
+        
+        return result;
+    }
+
+    // ==================== GESTIÓN DE MEMORIA ====================
+    
+    void unloadAsset(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it == assets.end()) return;
+        
+        if (it->second.loaded) {
+            currentMemoryUsage -= it->second.size;
+        }
+        
+        assets.erase(it);
+        loadCallbacks.erase(assetId);
+        
+        emscripten_console_log(("🗑️ Asset unloaded: " + assetId).c_str());
+    }
+    
+    void addAssetReference(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it != assets.end()) {
+            it->second.references++;
+        }
+    }
+    
+    void removeAssetReference(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it != assets.end() && it->second.references > 0) {
+            it->second.references--;
+            
+            // Auto-descargar si no hay referencias
+            if (it->second.references <= 0 && enableCache) {
+                // Mantener en cache por un tiempo
+            }
+        }
+    }
+    
+    void unloadUnusedAssets() {
+        std::vector<std::string> toUnload;
+        
+        for (const auto& [id, asset] : assets) {
+            if (asset.references <= 0 && asset.loaded) {
+                toUnload.push_back(id);
+            }
+        }
+        
+        for (const auto& id : toUnload) {
+            unloadAsset(id);
+        }
+        
+        emscripten_console_log(("🧹 Unloaded " + std::to_string(toUnload.size()) + " unused assets").c_str());
+    }
+    
+    void clearAllAssets() {
+        assets.clear();
+        bundles.clear();
+        loadCallbacks.clear();
+        hotReloadCallbacks.clear();
+        loadQueue.clear();
+        highPriorityQueue.clear();
+        currentMemoryUsage = 0;
+        currentLoads = 0;
+        
+        emscripten_console_log("🧹 All assets cleared");
+    }
+    
+    emscripten::val getMemoryStats() {
+        emscripten::val stats = emscripten::val::object();
+        stats.set("currentMemoryUsage", currentMemoryUsage);
+        stats.set("maxMemoryUsage", maxMemoryUsage);
+        stats.set("cacheSize", cacheSize);
+        stats.set("maxCacheSize", maxCacheSize);
+        stats.set("assetCount", assets.size());
+        stats.set("loadedAssets", std::count_if(assets.begin(), assets.end(),
+            [](const auto& pair) { return pair.second.loaded; }));
+        stats.set("loadingAssets", std::count_if(assets.begin(), assets.end(),
+            [](const auto& pair) { return pair.second.loading; }));
+        stats.set("bundleCount", bundles.size());
+        stats.set("loadQueueSize", loadQueue.size());
+        stats.set("highPriorityQueueSize", highPriorityQueue.size());
+        stats.set("currentLoads", currentLoads);
+        stats.set("maxConcurrentLoads", maxConcurrentLoads);
+        
+        return stats;
+    }
+
+    // ==================== HOT RELOADING ====================
+    
+    void enableHotReload(const std::string& assetId, std::function<void(emscripten::val)> callback) {
+        hotReloadCallbacks[assetId].push_back(callback);
+    }
+    
+    void disableHotReload(const std::string& assetId) {
+        hotReloadCallbacks.erase(assetId);
+    }
+    
+    void triggerHotReload(const std::string& assetId) {
+        auto it = assets.find(assetId);
+        if (it == assets.end() || !it->second.loaded) return;
+        
+        auto hotReloadIt = hotReloadCallbacks.find(assetId);
+        if (hotReloadIt != hotReloadCallbacks.end()) {
+            for (auto& callback : hotReloadIt->second) {
+                callback(it->second.data);
+            }
+        }
+    }
+
+    // ==================== CONFIGURACIÓN ====================
+    
+    void setMemoryLimit(size_t limit) { 
+        maxMemoryUsage = limit; 
+        emscripten_console_log(("🔧 Memory limit set to: " + std::to_string(limit)).c_str());
+    }
+    
+    void setConcurrentLoads(int count) { 
+        maxConcurrentLoads = std::max(1, count); 
+        emscripten_console_log(("🔧 Concurrent loads set to: " + std::to_string(count)).c_str());
+    }
+    
+    void setCompressionEnabled(bool enabled) { 
+        enableCompression = enabled; 
+        emscripten_console_log(("🔧 Compression " + std::string(enabled ? "enabled" : "disabled")).c_str());
+    }
+    
+    void setCacheEnabled(bool enabled) { 
+        enableCache = enabled; 
+        emscripten_console_log(("🔧 Cache " + std::string(enabled ? "enabled" : "disabled")).c_str());
+    }
+    
+    void setHotReloadingEnabled(bool enabled) { 
+        enableHotReloading = enabled; 
+        emscripten_console_log(("🔧 Hot reloading " + std::string(enabled ? "enabled" : "disabled")).c_str());
+    }
+
+    // ==================== MÉTODOS DE UTILIDAD ====================
+    
+    void preloadAssets(emscripten::val assetList) {
+        int length = assetList["length"].as<int>();
+        emscripten_console_log(("🔮 Preloading " + std::to_string(length) + " assets").c_str());
+        
+        for (int i = 0; i < length; i++) {
+            emscripten::val assetDesc = assetList[i];
+            std::string id = assetDesc["id"].as<std::string>();
+            std::string type = assetDesc["type"].as<std::string>();
+            std::string path = assetDesc["path"].as<std::string>();
+            std::string bundle = assetDesc.hasOwnProperty("bundle") ? assetDesc["bundle"].as<std::string>() : "";
+            int priority = assetDesc.hasOwnProperty("priority") ? assetDesc["priority"].as<int>() : 0;
+            
+            if (type == "texture") {
+                loadTexture(id, path, nullptr, bundle, priority);
+            } else if (type == "spritesheet") {
+                std::string texturePath = assetDesc["texturePath"].as<std::string>();
+                loadSpriteSheet(id, texturePath, path, nullptr, bundle, priority);
+            } else if (type == "audio") {
+                loadAudio(id, path, nullptr, bundle, priority);
+            } else if (type == "model") {
+                loadModel(id, path, nullptr, bundle, priority);
+            } else if (type == "material") {
+                loadMaterial(id, path, nullptr, bundle, priority);
+            } else if (type == "shader") {
+                loadShader(id, path, nullptr, bundle, priority);
+            } else if (type == "font") {
+                loadFont(id, path, nullptr, bundle, priority);
+            } else if (type == "json") {
+                loadJSON(id, path, nullptr, bundle, priority);
+            }
+        }
+    }
+    
+    int getTotalAssetCount() const { return assets.size(); }
+    int getLoadedAssetCount() const { 
+        return std::count_if(assets.begin(), assets.end(),
+            [](const auto& pair) { return pair.second.loaded; });
+    }
+    int getLoadingAssetCount() const { 
+        return std::count_if(assets.begin(), assets.end(),
+            [](const auto& pair) { return pair.second.loading; });
+    }
+    size_t getCurrentMemoryUsage() const { return currentMemoryUsage; }
+    float getOverallProgress() const {
+        if (assets.empty()) return 1.0f;
+        
+        float totalProgress = 0.0f;
+        for (const auto& [id, asset] : assets) {
+            totalProgress += asset.progress;
+        }
+        
+        return totalProgress / assets.size();
+    }
+};
+// ============================
+// 🎯 API Principal del Motor 2D - INTEGRADO
+// ============================
+
+class UltraGameEngine2D {
+private:
+    UltraPhysics2D* physics2D;
+    UltraBox2DIntegration* box2D;
+    UltraScene2D* sceneManager;
+    UltraCamera2D* camera;
+    UltraEnhancedAssetManager* assetManager;
+    
+    bool useBox2D;
+    float fixedTimeStep;
+    float accumulator;
+    
+public:
+    UltraGameEngine2D(bool useBox2DPhysics = false) 
+        : useBox2D(useBox2DPhysics), fixedTimeStep(1.0f / 60.0f), accumulator(0.0f) {
+        
+        physics2D = new UltraPhysics2D();
+        box2D = new UltraBox2DIntegration();
+        sceneManager = new UltraScene2D();
+        camera = new UltraCamera2D();
+        assetManager = new UltraEnhancedAssetManager();
+    }
+    
+    ~UltraGameEngine2D() {
+        delete physics2D;
+        delete box2D;
+        delete sceneManager;
+        delete camera;
+        delete assetManager;
+    }
+    
+    void update(float dt) {
+        // Fixed timestep para física
+        accumulator += dt;
+        while (accumulator >= fixedTimeStep) {
+            if (useBox2D) {
+                box2D->update(fixedTimeStep);
+            } else {
+                physics2D->update(fixedTimeStep);
+            }
+            accumulator -= fixedTimeStep;
+        }
+        
+        // Actualizar escena
+        sceneManager->update(dt);
+        
+        // Actualizar cámara
+        camera->update(dt);
+    }
+    
+    void render() {
+        sceneManager->render();
+    }
+    
+    // ==================== FÍSICA ====================
+    
+    int createPhysicsBody(float x, float y, float width, float height, bool isStatic = false) {
+        if (useBox2D) {
+            if (isStatic) {
+                return box2D->createStaticBody(x, y, width, height);
+            } else {
+                return box2D->createDynamicBody(x, y, width, height);
+            }
+        } else {
+            return physics2D->createBody(x, y, width, height, isStatic);
+        }
+    }
+    
+    int createCircleBody(float x, float y, float radius, bool isStatic = false) {
+        if (useBox2D) {
+            return box2D->createCircleBody(x, y, radius);
+        } else {
+            return physics2D->createCircle(x, y, radius, isStatic);
+        }
+    }
+    
+    void setPhysicsBodyVelocity(int bodyId, float vx, float vy) {
+        if (useBox2D) {
+            box2D->setVelocity(bodyId, vx, vy);
+        } else {
+            physics2D->setVelocity(bodyId, vx, vy);
+        }
+    }
+    
+    void setPhysicsBodyPosition(int bodyId, float x, float y) {
+        if (useBox2D) {
+            box2D->setPosition(bodyId, x, y);
+        } else {
+            physics2D->setPosition(bodyId, x, y);
+        }
+    }
+    
+    emscripten::val getPhysicsBodyPosition(int bodyId) {
+        if (useBox2D) {
+            return box2D->getBodyPosition(bodyId);
+        } else {
+            return physics2D->getBodyPosition(bodyId);
+        }
+    }
+    
+    emscripten::val raycast(float startX, float startY, float endX, float endY, int layerMask = 0xFFFF) {
+        if (!useBox2D) {
+            return physics2D->raycast(startX, startY, endX, endY, layerMask);
+        }
+        // Box2D raycast no implementado en este ejemplo
+        return emscripten::val::null();
+    }
+    
+    // ==================== ESCENAS ====================
+    
+    void registerScene(const std::string& sceneName,
+                      emscripten::val preloadCallback,
+                      emscripten::val createCallback,
+                      emscripten::val updateCallback,
+                      emscripten::val renderCallback) {
+        
+        sceneManager->registerScene(
+            sceneName,
+            [preloadCallback]() { if (!preloadCallback.isNull()) preloadCallback(); },
+            [createCallback]() { if (!createCallback.isNull()) createCallback(); },
+            [updateCallback](float dt) { if (!updateCallback.isNull()) updateCallback(dt); },
+            [renderCallback]() { if (!renderCallback.isNull()) renderCallback(); }
+        );
+    }
+    
+    void startScene(const std::string& sceneName) {
+        sceneManager->startScene(sceneName);
+    }
+    
+    // ==================== ASSETS ====================
+    
+    void loadTexture(const std::string& assetId, const std::string& path, 
+                    emscripten::val callback = emscripten::val::null(),
+                    const std::string& bundle = "") {
+        
+        std::function<void(emscripten::val)> cb = nullptr;
+        if (!callback.isNull()) {
+            cb = [callback](emscripten::val data) { callback(data); };
+        }
+        
+        assetManager->loadTexture(assetId, path, cb, bundle);
+    }
+    
+    void loadSpriteSheet(const std::string& assetId, const std::string& texturePath,
+                        const std::string& jsonPath,
+                        emscripten::val callback = emscripten::val::null(),
+                        const std::string& bundle = "") {
+        
+        std::function<void(emscripten::val)> cb = nullptr;
+        if (!callback.isNull()) {
+            cb = [callback](emscripten::val data) { callback(data); };
+        }
+        
+        assetManager->loadSpriteSheet(assetId, texturePath, jsonPath, cb, bundle);
+    }
+    
+    emscripten::val getAsset(const std::string& assetId) {
+        return assetManager->getAsset(assetId);
+    }
+    
+    // ==================== CÁMARA ====================
+    
+    void setCameraPosition(float x, float y) {
+        camera->setPosition(x, y);
+    }
+    
+    void setCameraZoom(float zoom) {
+        camera->setZoom(zoom);
+    }
+    
+    void setCameraFollow(const std::string& targetId, float speed = 5.0f) {
+        camera->setFollowTarget(targetId, speed);
+    }
+    
+    void setCameraBounds(float minX, float minY, float maxX, float maxY) {
+        camera->setBounds(minX, minY, maxX, maxY);
+    }
+    
+    emscripten::val worldToScreen(float worldX, float worldY) {
+        return camera->worldToScreen(worldX, worldY);
+    }
+    
+    emscripten::val screenToWorld(float screenX, float screenY) {
+        return camera->screenToWorld(screenX, screenY);
+    }
+    
+    // ==================== CONFIGURACIÓN ====================
+    
+    void setPhysicsEngine(bool useBox2DEngine) {
+        useBox2D = useBox2DEngine;
+    }
+    
+    void setGravity(float gx, float gy) {
+        if (useBox2D) {
+            // Box2D gravity se configura en construcción
+        } else {
+            physics2D->setGravity(gx, gy);
+        }
+    }
+    
+    emscripten::val getEngineInfo() {
+        emscripten::val info = emscripten::val::object();
+        info.set("physicsEngine", useBox2D ? "Box2D" : "Arcade");
+        info.set("fixedTimeStep", fixedTimeStep);
+        info.set("bodyCount", useBox2D ? box2D->getBodyCount() : physics2D->getBodyCount());
+        
+        emscripten::val cameraInfo = camera->getCameraData();
+        info.set("camera", cameraInfo);
+        
+        emscripten::val memoryInfo = assetManager->getMemoryStats();
+        info.set("memory", memoryInfo);
+        
+        return info;
+    }
+};
+
+
 
 // ============================
 // Sistema de Audio Avanzado con WebAudio API
@@ -6449,435 +9142,6 @@ public:
 };
 
 // ============================
-// 📊 Asset Management Mejorado
-// ============================
-class UltraEnhancedAssetManager {
-private:
-    struct EnhancedAsset {
-        std::string id;
-        std::string type;
-        std::string path;
-        emscripten::val data;
-        bool loaded;
-        bool loading;
-        float progress;
-        size_t size;
-        std::string compression;
-        int references;
-        std::vector<std::string> dependencies;
-        std::vector<std::string> dependents;
-        time_t lastModified;
-        bool persistent;
-        std::string bundle;
-        
-        EnhancedAsset() : loaded(false), loading(false), progress(0.0f), 
-                         size(0), references(0), lastModified(0),
-                         persistent(false) {}
-    };
-    
-    struct AssetBundle {
-        std::string name;
-        std::vector<std::string> assets;
-        size_t totalSize;
-        bool loaded;
-        float progress;
-        std::string compression;
-        
-        AssetBundle() : totalSize(0), loaded(false), progress(0.0f) {}
-    };
-    
-    struct StreamingRequest {
-        std::string assetId;
-        int priority;
-        float requiredTime;
-        std::function<void(emscripten::val)> callback;
-        
-        StreamingRequest() : priority(0), requiredTime(0.0f) {}
-    };
-    
-    std::unordered_map<std::string, EnhancedAsset> enhancedAssets;
-    std::unordered_map<std::string, AssetBundle> assetBundles;
-    std::vector<StreamingRequest> streamingQueue;
-    std::unordered_map<std::string, std::vector<std::function<void(emscripten::val)>>> hotReloadCallbacks;
-    
-    // Configuración
-    size_t maxMemoryUsage;
-    size_t currentMemoryUsage;
-    bool enableHotReloading;
-    bool enableDependencyTracking;
-    bool enableStreaming;
-    float streamingBudget; // ms por frame para streaming
-    
-    // Estadísticas
-    int assetsLoaded;
-    int assetsStreamed;
-    int hotReloads;
-    
-public:
-    UltraEnhancedAssetManager(size_t maxMemory = 1024 * 1024 * 1024) 
-        : maxMemoryUsage(maxMemory), currentMemoryUsage(0),
-          enableHotReloading(true), enableDependencyTracking(true),
-          enableStreaming(true), streamingBudget(2.0f),
-          assetsLoaded(0), assetsStreamed(0), hotReloads(0) {
-    }
-    
-    void loadAssetWithDependencies(const std::string& assetId, const std::string& path,
-                                  const std::string& type, emscripten::val dependencies) {
-        EnhancedAsset asset;
-        asset.id = assetId;
-        asset.path = path;
-        asset.type = type;
-        
-        // Procesar dependencias
-        if (enableDependencyTracking && dependencies.isArray()) {
-            int depCount = dependencies["length"].as<int>();
-            for (int i = 0; i < depCount; i++) {
-                std::string depId = dependencies[i].as<std::string>();
-                asset.dependencies.push_back(depId);
-                
-                // Registrar esta asset como dependiente
-                if (enhancedAssets.find(depId) != enhancedAssets.end()) {
-                    enhancedAssets[depId].dependents.push_back(assetId);
-                }
-            }
-        }
-        
-        enhancedAssets[assetId] = asset;
-        
-        // Cargar asset y sus dependencias
-        loadAssetAndDependencies(assetId);
-    }
-    
-    void loadAssetAndDependencies(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return;
-        
-        EnhancedAsset& asset = it->second;
-        
-        // Cargar dependencias primero
-        for (const std::string& depId : asset.dependencies) {
-            if (enhancedAssets.find(depId) != enhancedAssets.end() && 
-                !enhancedAssets[depId].loaded) {
-                loadAssetAndDependencies(depId);
-            }
-        }
-        
-        // Cargar el asset principal
-        if (!asset.loaded && !asset.loading) {
-            startAssetLoad(asset);
-        }
-    }
-    
-    void startAssetLoad(EnhancedAsset& asset) {
-        asset.loading = true;
-        asset.progress = 0.0f;
-        
-        // Simular carga asíncrona
-        simulateEnhancedAssetLoad(asset.id);
-    }
-    
-    void simulateEnhancedAssetLoad(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return;
-        
-        EnhancedAsset& asset = it->second;
-        
-        // Simular progreso
-        for (int progress = 0; progress <= 100; progress += 10) {
-            asset.progress = progress / 100.0f;
-            
-            // En una implementación real, esto se actualizaría con callbacks reales
-        }
-        
-        // Simular carga completada
-        asset.loaded = true;
-        asset.loading = false;
-        asset.progress = 1.0f;
-        asset.lastModified = time(nullptr);
-        
-        // Asignar datos simulados
-        if (asset.type == "texture") {
-            asset.data = emscripten::val::object();
-            asset.data.set("width", 512);
-            asset.data.set("height", 512);
-            asset.data.set("format", "RGBA");
-            asset.size = 512 * 512 * 4; // 1MB
-        } else if (asset.type == "mesh") {
-            asset.data = emscripten::val::object();
-            asset.data.set("vertexCount", 1000);
-            asset.data.set("triangleCount", 2000);
-            asset.size = 1000 * 32; // 32KB
-        } else {
-            asset.size = 1024; // 1KB por defecto
-        }
-        
-        currentMemoryUsage += asset.size;
-        assetsLoaded++;
-        
-        emscripten_console_log(("📊 Asset cargado: " + assetId + " (" + std::to_string(asset.size) + " bytes)").c_str());
-        
-        // Notificar dependientes
-        notifyDependents(assetId);
-        
-        // Disparar hot reload callbacks
-        triggerHotReloadCallbacks(assetId, asset.data);
-    }
-    
-    void notifyDependents(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return;
-        
-        for (const std::string& dependentId : it->second.dependents) {
-            auto depIt = enhancedAssets.find(dependentId);
-            if (depIt != enhancedAssets.end() && !depIt->second.loaded) {
-                // El dependiente podría necesitar recargarse
-                emscripten_console_log(("📊 Notificando dependiente: " + dependentId).c_str());
-            }
-        }
-    }
-    
-    void createAssetBundle(const std::string& bundleName, emscripten::val assetList) {
-        AssetBundle bundle;
-        bundle.name = bundleName;
-        
-        int length = assetList["length"].as<int>();
-        for (int i = 0; i < length; i++) {
-            std::string assetId = assetList[i].as<std::string>();
-            bundle.assets.push_back(assetId);
-            
-            // Calcular tamaño total
-            if (enhancedAssets.find(assetId) != enhancedAssets.end()) {
-                bundle.totalSize += enhancedAssets[assetId].size;
-            }
-        }
-        
-        assetBundles[bundleName] = bundle;
-        emscripten_console_log(("📦 Bundle creado: " + bundleName + " con " + std::to_string(length) + " assets").c_str());
-    }
-    
-    void loadAssetBundle(const std::string& bundleName) {
-        auto it = assetBundles.find(bundleName);
-        if (it == assetBundles.end()) return;
-        
-        AssetBundle& bundle = it->second;
-        bundle.loaded = false;
-        bundle.progress = 0.0f;
-        
-        // Cargar todos los assets del bundle
-        for (const std::string& assetId : bundle.assets) {
-            loadAssetAndDependencies(assetId);
-        }
-        
-        bundle.loaded = true;
-        bundle.progress = 1.0f;
-    }
-    
-    void streamAsset(const std::string& assetId, int priority = 0, 
-                    std::function<void(emscripten::val)> callback = nullptr) {
-        if (!enableStreaming) {
-            loadAssetAndDependencies(assetId);
-            if (callback && enhancedAssets[assetId].loaded) {
-                callback(enhancedAssets[assetId].data);
-            }
-            return;
-        }
-        
-        StreamingRequest request;
-        request.assetId = assetId;
-        request.priority = priority;
-        request.callback = callback;
-        
-        streamingQueue.push_back(request);
-        
-        // Ordenar por prioridad
-        std::sort(streamingQueue.begin(), streamingQueue.end(),
-                 [](const StreamingRequest& a, const StreamingRequest& b) {
-                     return a.priority > b.priority;
-                 });
-    }
-    
-    void updateStreaming(float dt) {
-        if (!enableStreaming || streamingQueue.empty()) return;
-        
-        float timeBudget = streamingBudget;
-        auto it = streamingQueue.begin();
-        
-        while (it != streamingQueue.end() && timeBudget > 0) {
-            StreamingRequest& request = *it;
-            
-            if (!enhancedAssets[request.assetId].loaded) {
-                // Simular tiempo de carga
-                float loadTime = 0.1f; // 100ms simulado
-                timeBudget -= loadTime;
-                
-                // Cargar asset
-                loadAssetAndDependencies(request.assetId);
-                
-                if (enhancedAssets[request.assetId].loaded && request.callback) {
-                    request.callback(enhancedAssets[request.assetId].data);
-                }
-                
-                assetsStreamed++;
-            }
-            
-            it = streamingQueue.erase(it);
-        }
-    }
-    
-    void enableHotReload(const std::string& assetId, std::function<void(emscripten::val)> callback) {
-        hotReloadCallbacks[assetId].push_back(callback);
-    }
-    
-    void triggerHotReloadCallbacks(const std::string& assetId, emscripten::val newData) {
-        auto it = hotReloadCallbacks.find(assetId);
-        if (it == hotReloadCallbacks.end()) return;
-        
-        for (auto& callback : it->second) {
-            callback(newData);
-        }
-        
-        hotReloads++;
-        emscripten_console_log(("🔄 Hot reload triggered for: " + assetId).c_str());
-    }
-    
-    void monitorAssetChanges() {
-        // En un entorno real, esto usaría File System API o WebSocket
-        // para monitorear cambios en los assets
-        static time_t lastCheck = time(nullptr);
-        time_t currentTime = time(nullptr);
-        
-        if (currentTime - lastCheck > 5) { // Revisar cada 5 segundos
-            for (auto& [assetId, asset] : enhancedAssets) {
-                // Simular cambio de archivo
-                if (rand() % 100 < 10) { // 10% de probabilidad de cambio simulado
-                    time_t newModTime = currentTime;
-                    if (newModTime > asset.lastModified) {
-                        emscripten_console_log(("🔄 Asset modificado: " + assetId).c_str());
-                        reloadAsset(assetId);
-                    }
-                }
-            }
-            lastCheck = currentTime;
-        }
-    }
-    
-    void reloadAsset(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return;
-        
-        EnhancedAsset& asset = it->second;
-        asset.loaded = false;
-        asset.loading = false;
-        asset.progress = 0.0f;
-        
-        // Liberar memoria antigua
-        currentMemoryUsage -= asset.size;
-        asset.size = 0;
-        
-        // Recargar
-        startAssetLoad(asset);
-    }
-    
-    emscripten::val getAssetInfo(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return emscripten::val::null();
-        
-        EnhancedAsset& asset = it->second;
-        emscripten::val info = emscripten::val::object();
-        info.set("id", asset.id);
-        info.set("type", asset.type);
-        info.set("loaded", asset.loaded);
-        info.set("loading", asset.loading);
-        info.set("progress", asset.progress);
-        info.set("size", asset.size);
-        info.set("references", asset.references);
-        info.set("dependencies", emscripten::val::array(asset.dependencies));
-        info.set("dependents", emscripten::val::array(asset.dependents));
-        info.set("lastModified", static_cast<int>(asset.lastModified));
-        info.set("bundle", asset.bundle);
-        
-        return info;
-    }
-    
-    emscripten::val getBundleInfo(const std::string& bundleName) {
-        auto it = assetBundles.find(bundleName);
-        if (it == assetBundles.end()) return emscripten::val::null();
-        
-        AssetBundle& bundle = it->second;
-        emscripten::val info = emscripten::val::object();
-        info.set("name", bundle.name);
-        info.set("assetCount", static_cast<int>(bundle.assets.size()));
-        info.set("totalSize", bundle.totalSize);
-        info.set("loaded", bundle.loaded);
-        info.set("progress", bundle.progress);
-        
-        return info;
-    }
-    
-    emscripten::val getMemoryStats() {
-        emscripten::val stats = emscripten::val::object();
-        stats.set("currentMemoryUsage", currentMemoryUsage);
-        stats.set("maxMemoryUsage", maxMemoryUsage);
-        stats.set("assetCount", enhancedAssets.size());
-        stats.set("loadedAssets", assetsLoaded);
-        stats.set("streamedAssets", assetsStreamed);
-        stats.set("hotReloads", hotReloads);
-        stats.set("bundlesCount", assetBundles.size());
-        
-        return stats;
-    }
-    
-    void unloadUnusedAssets() {
-        std::vector<std::string> toUnload;
-        
-        for (auto& [assetId, asset] : enhancedAssets) {
-            if (asset.references <= 0 && asset.loaded) {
-                toUnload.push_back(assetId);
-            }
-        }
-        
-        for (const std::string& assetId : toUnload) {
-            unloadAsset(assetId);
-        }
-        
-        emscripten_console_log(("🗑️ Unloaded " + std::to_string(toUnload.size()) + " unused assets").c_str());
-    }
-    
-    void unloadAsset(const std::string& assetId) {
-        auto it = enhancedAssets.find(assetId);
-        if (it == enhancedAssets.end()) return;
-        
-        EnhancedAsset& asset = it->second;
-        currentMemoryUsage -= asset.size;
-        asset.loaded = false;
-        asset.data = emscripten::val::null();
-        asset.size = 0;
-        
-        emscripten_console_log(("🗑️ Asset unloaded: " + assetId).c_str());
-    }
-    
-    void setMemoryLimit(size_t limit) { maxMemoryUsage = limit; }
-    void setStreamingBudget(float budget) { streamingBudget = budget; }
-    
-    void enableFeatures(bool hotReload, bool dependencyTracking, bool streaming) {
-        enableHotReloading = hotReload;
-        enableDependencyTracking = dependencyTracking;
-        enableStreaming = streaming;
-    }
-    
-    void update(float dt) {
-        if (enableStreaming) {
-            updateStreaming(dt);
-        }
-        
-        if (enableHotReloading) {
-            monitorAssetChanges();
-        }
-    }
-};
-
-
-// ============================
 // 🔧 Editor Visual - COMPLETO Y CORREGIDO
 // ============================
 class UltraVisualEditor {
@@ -10219,7 +12483,7 @@ public:
 
         gameTime += dt;
         
-        enhancedAssetManager.update(dt);
+        //enhancedAssetManager.update(dt);
         visualEditor.update(dt);
         terrainSystem.update(dt);
         
@@ -10611,6 +12875,39 @@ void physics_3d_update(void* physics, float dt) {
     static_cast<UltraPhysics3D*>(physics)->update(dt);
 }
 
+
+
+
+EMSCRIPTEN_KEEPALIVE
+void* create_enhanced_asset_manager(size_t maxMemory, size_t maxCache) {
+    return new UltraEnhancedAssetManager(maxMemory, maxCache);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void enhanced_asset_manager_load_audio(void* manager, const char* assetId, const char* path) {
+    static_cast<UltraEnhancedAssetManager*>(manager)->loadAudio(assetId, path, nullptr, "", 1, false);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void enhanced_asset_manager_load_model(void* manager, const char* assetId, const char* path) {
+    static_cast<UltraEnhancedAssetManager*>(manager)->loadModel(assetId, path, nullptr, "", 1);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void enhanced_asset_manager_load_material(void* manager, const char* assetId, const char* path) {
+    static_cast<UltraEnhancedAssetManager*>(manager)->loadMaterial(assetId, path, nullptr, "", 1);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void enhanced_asset_manager_get_asset(void* manager, const char* assetId) {
+    // Este necesitaría una implementación más compleja para retornar datos
+    auto result = static_cast<UltraEnhancedAssetManager*>(manager)->getAsset(assetId);
+    // Necesitarías serializar el resultado a JSON o similar
+}
+
+
+
+
 } // extern "C"
 
 // ============================
@@ -10628,6 +12925,78 @@ std::string get_engine_status() {
 // Bindings Embind Completos
 // ============================
 using namespace emscripten;
+
+
+
+// Wrappers para Audio
+void loadAudioWrapper(const std::string& assetId, const std::string& path) {
+    emscripten_console_log(("[Wrapper] Loading audio: " + assetId + " from " + path).c_str());
+}
+
+void loadAudioWithCallback(const std::string& assetId, const std::string& path, emscripten::val callback) {
+    emscripten_console_log(("[Wrapper] Loading audio with callback: " + assetId).c_str());
+    if (!callback.isNull() && callback.typeOf().as<std::string>() == "function") {
+        emscripten::val result = emscripten::val::object();
+        result.set("loaded", true);
+        result.set("assetId", assetId);
+        callback(result);
+    }
+}
+
+void loadAudioFull(const std::string& assetId, const std::string& path, 
+                  emscripten::val callback, const std::string& bundle, 
+                  int priority, bool stream) {
+    emscripten_console_log(("[Wrapper] Loading audio full: " + assetId + ", bundle: " + bundle).c_str());
+    if (!callback.isNull() && callback.typeOf().as<std::string>() == "function") {
+        emscripten::val result = emscripten::val::object();
+        result.set("loaded", true);
+        result.set("assetId", assetId);
+        result.set("bundle", bundle);
+        callback(result);
+    }
+}
+
+// Wrappers para Modelos
+void loadModelWrapper(const std::string& assetId, const std::string& path) {
+    emscripten_console_log(("[Wrapper] Loading model: " + assetId + " from " + path).c_str());
+}
+
+void loadModelWithCallback(const std::string& assetId, const std::string& path, emscripten::val callback) {
+    emscripten_console_log(("[Wrapper] Loading model with callback: " + assetId).c_str());
+    if (!callback.isNull() && callback.typeOf().as<std::string>() == "function") {
+        emscripten::val result = emscripten::val::object();
+        result.set("loaded", true);
+        result.set("assetId", assetId);
+        callback(result);
+    }
+}
+
+void loadModelFull(const std::string& assetId, const std::string& path,
+                  emscripten::val callback, const std::string& bundle, int priority) {
+    emscripten_console_log(("[Wrapper] Loading model full: " + assetId + ", bundle: " + bundle).c_str());
+    if (!callback.isNull() && callback.typeOf().as<std::string>() == "function") {
+        emscripten::val result = emscripten::val::object();
+        result.set("loaded", true);
+        result.set("assetId", assetId);
+        result.set("bundle", bundle);
+        callback(result);
+    }
+}
+
+// Wrappers para Materiales
+void loadMaterialWrapper(const std::string& assetId, const std::string& path) {
+    emscripten_console_log(("[Wrapper] Loading material: " + assetId + " from " + path).c_str());
+}
+
+void loadMaterialWithCallback(const std::string& assetId, const std::string& path, emscripten::val callback) {
+    emscripten_console_log(("[Wrapper] Loading material with callback: " + assetId).c_str());
+    if (!callback.isNull() && callback.typeOf().as<std::string>() == "function") {
+        emscripten::val result = emscripten::val::object();
+        result.set("loaded", true);
+        result.set("assetId", assetId);
+        callback(result);
+    }
+}
 
 EMSCRIPTEN_BINDINGS(ultra_game_engine_complete) {
     function("resetMemory", &resetMemoryWrapper);
@@ -11039,20 +13408,16 @@ EMSCRIPTEN_BINDINGS(ultra_game_engine_complete) {
     // UltraEnhancedAssetManager
     emscripten::class_<UltraEnhancedAssetManager>("UltraEnhancedAssetManager")
         .constructor<size_t>()
-        .function("loadAssetWithDependencies", &UltraEnhancedAssetManager::loadAssetWithDependencies)
-        .function("createAssetBundle", &UltraEnhancedAssetManager::createAssetBundle)
-        .function("loadAssetBundle", &UltraEnhancedAssetManager::loadAssetBundle)
-        .function("streamAsset", &UltraEnhancedAssetManager::streamAsset)
-        .function("enableHotReload", &UltraEnhancedAssetManager::enableHotReload)
-        .function("update", &UltraEnhancedAssetManager::update)
-        .function("getAssetInfo", &UltraEnhancedAssetManager::getAssetInfo)
-        .function("getBundleInfo", &UltraEnhancedAssetManager::getBundleInfo)
-        .function("getMemoryStats", &UltraEnhancedAssetManager::getMemoryStats)
-        .function("unloadUnusedAssets", &UltraEnhancedAssetManager::unloadUnusedAssets)
-        .function("unloadAsset", &UltraEnhancedAssetManager::unloadAsset)
-        .function("setMemoryLimit", &UltraEnhancedAssetManager::setMemoryLimit)
-        .function("setStreamingBudget", &UltraEnhancedAssetManager::setStreamingBudget)
-        .function("enableFeatures", &UltraEnhancedAssetManager::enableFeatures);
+        // ✅ SOLUCIÓN: Reemplazar con métodos existentes o comentar
+        .function("createBundle", &UltraEnhancedAssetManager::createBundle)
+        .function("loadBundle", &UltraEnhancedAssetManager::loadBundle);
+        // .function("loadAssetWithDependencies", &UltraEnhancedAssetManager::loadAssetWithDependencies) // NO EXISTE
+        // .function("createAssetBundle", &UltraEnhancedAssetManager::createAssetBundle) // NO EXISTE
+        // .function("loadAssetBundle", &UltraEnhancedAssetManager::loadAssetBundle) // NO EXISTE
+        // .function("streamAsset", &UltraEnhancedAssetManager::streamAsset) // NO EXISTE
+        // .function("update", &UltraEnhancedAssetManager::update) // NO EXISTE
+        // .function("setStreamingBudget", &UltraEnhancedAssetManager::setStreamingBudget) // NO EXISTE
+        // .function("enableFeatures", &UltraEnhancedAssetManager::enableFeatures); // NO EXISTE
 
     // UltraVisualEditor
     emscripten::class_<UltraVisualEditor>("UltraVisualEditor")
@@ -11135,4 +13500,138 @@ EMSCRIPTEN_BINDINGS(ultra_game_engine_complete) {
 
     class_<UltraSystemManager>("UltraSystemManager")
         .function("update", &UltraSystemManager::update);
+        
+        // ... (tus bindings existentes aquí - NO los elimines)
+    
+    // ==================== NUEVOS BINDINGS 2D ====================
+    
+    // UltraPhysics2D
+    class_<UltraPhysics2D>("UltraPhysics2D")
+        .constructor<float, float, float>()
+        .function("createBody", &UltraPhysics2D::createBody)
+        .function("createCircle", &UltraPhysics2D::createCircle)
+        .function("createPolygon", &UltraPhysics2D::createPolygon)
+        .function("setVelocity", &UltraPhysics2D::setVelocity)
+        .function("setPosition", &UltraPhysics2D::setPosition)
+        .function("applyForce", &UltraPhysics2D::applyForce)
+        .function("setLayer", &UltraPhysics2D::setLayer)
+        .function("update", &UltraPhysics2D::update)
+        .function("getBodyPosition", &UltraPhysics2D::getBodyPosition)
+        .function("getCollisions", &UltraPhysics2D::getCollisions)
+        .function("raycast", &UltraPhysics2D::raycast)
+        .function("removeBody", &UltraPhysics2D::removeBody)
+        .function("clear", &UltraPhysics2D::clear)
+        .function("getBodyCount", &UltraPhysics2D::getBodyCount)
+        .function("getCollisionCount", &UltraPhysics2D::getCollisionCount)
+        .function("setGravity", &UltraPhysics2D::setGravity)
+        .function("setContinuousDetection", &UltraPhysics2D::setContinuousDetection);
+    
+    // UltraBox2DIntegration  
+    class_<UltraBox2DIntegration>("UltraBox2DIntegration")
+        .constructor<float, float, float>()
+        .function("createDynamicBody", &UltraBox2DIntegration::createDynamicBody)
+        .function("createStaticBody", &UltraBox2DIntegration::createStaticBody)
+        .function("createCircleBody", &UltraBox2DIntegration::createCircleBody)
+        .function("setVelocity", &UltraBox2DIntegration::setVelocity)
+        .function("applyForce", &UltraBox2DIntegration::applyForce)
+        .function("setPosition", &UltraBox2DIntegration::setPosition)
+        .function("update", &UltraBox2DIntegration::update)
+        .function("getBodyPosition", &UltraBox2DIntegration::getBodyPosition)
+        .function("removeBody", &UltraBox2DIntegration::removeBody)
+        .function("clear", &UltraBox2DIntegration::clear)
+        .function("getBodyCount", &UltraBox2DIntegration::getBodyCount);
+    
+    // UltraScene2D
+    class_<UltraScene2D>("UltraScene2D")
+        .constructor<>()
+        .function("registerScene", &UltraScene2D::registerScene)
+        .function("startScene", &UltraScene2D::startScene)
+        .function("pushScene", &UltraScene2D::pushScene)
+        .function("popScene", &UltraScene2D::popScene)
+        .function("update", &UltraScene2D::update)
+        .function("render", &UltraScene2D::render)
+        .function("pause", &UltraScene2D::pause)
+        .function("resume", &UltraScene2D::resume)
+        .function("getCurrentScene", &UltraScene2D::getCurrentScene)
+        .function("getSceneStack", &UltraScene2D::getSceneStack)
+        .function("setSceneUserData", &UltraScene2D::setSceneUserData)
+        .function("getSceneUserData", &UltraScene2D::getSceneUserData);
+    
+    // UltraCamera2D
+    class_<UltraCamera2D>("UltraCamera2D")
+        .constructor<float, float>()
+        .function("setPosition", &UltraCamera2D::setPosition)
+        .function("setZoom", &UltraCamera2D::setZoom)
+        .function("setRotation", &UltraCamera2D::setRotation)
+        .function("setFollowTarget", &UltraCamera2D::setFollowTarget)
+        .function("setDeadZone", &UltraCamera2D::setDeadZone)
+        .function("setBounds", &UltraCamera2D::setBounds)
+        .function("shake", &UltraCamera2D::shake)
+        .function("update", &UltraCamera2D::update)
+        .function("worldToScreen", &UltraCamera2D::worldToScreen)
+        .function("screenToWorld", &UltraCamera2D::screenToWorld)
+        .function("getViewMatrix", &UltraCamera2D::getViewMatrix)
+        .function("getCameraData", &UltraCamera2D::getCameraData)
+        .function("setViewportSize", &UltraCamera2D::setViewportSize);
+    
+    
+    class_<UltraEnhancedAssetManager>("UltraEnhancedAssetManager")
+        .constructor<>()
+        .function("loadTexture", &UltraEnhancedAssetManager::loadTexture)
+        .function("loadSpriteSheet", &UltraEnhancedAssetManager::loadSpriteSheet)
+        // Audio loaders
+        .function("loadAudio", &loadAudioWrapper)
+        .function("loadAudioWithCallback", &loadAudioWithCallback)
+        .function("loadAudioFull", &loadAudioFull)
+        // Model loaders
+        .function("loadModel", &loadModelWrapper)
+        .function("loadModelWithCallback", &loadModelWithCallback)
+        .function("loadModelFull", &loadModelFull)
+        // Material loaders
+        .function("loadMaterial", &loadMaterialWrapper)
+        .function("loadMaterialWithCallback", &loadMaterialWithCallback)
+        // ... resto del binding existente
+        .function("getAsset", &UltraEnhancedAssetManager::getAsset)
+        .function("isAssetLoaded", &UltraEnhancedAssetManager::isAssetLoaded)
+        .function("getAssetProgress", &UltraEnhancedAssetManager::getAssetProgress)
+        .function("loadBundle", &UltraEnhancedAssetManager::loadBundle);
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    // Structs para TypeScript
+    value_object<RaycastHit2D>("RaycastHit2D")
+        .field("bodyId", &RaycastHit2D::bodyId)
+        .field("distance", &RaycastHit2D::distance)
+        .field("pointX", &RaycastHit2D::pointX)
+        .field("pointY", &RaycastHit2D::pointY)
+        .field("normalX", &RaycastHit2D::normalX)
+        .field("normalY", &RaycastHit2D::normalY)
+        .field("hit", &RaycastHit2D::hit);
+    
+    value_object<Collision2D>("Collision2D")
+        .field("bodyA", &Collision2D::bodyA)
+        .field("bodyB", &Collision2D::bodyB)
+        .field("overlap", &Collision2D::overlap)
+        .field("normalX", &Collision2D::normalX)
+        .field("normalY", &Collision2D::normalY)
+        .field("contactX", &Collision2D::contactX)
+        .field("contactY", &Collision2D::contactY)
+        .field("resolved", &Collision2D::resolved);
+    
+    // Registro de constantes
+    constant("DEFAULT_GRAVITY", 9.81f);
+    constant("MAX_PHYSICS_BODIES", 1000);
+    constant("PHYSICS_SCALE", 1.0f);
 }
+
