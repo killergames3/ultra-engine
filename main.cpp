@@ -8365,7 +8365,8 @@ public:
         emscripten::val indicesVal = emscripten::val::array(indices);
         
         std::string meshName = "terrain_chunk_" + std::to_string(chunk.x) + "_" + std::to_string(chunk.z);
-        chunk.mesh = renderer->createMesh(meshName, verticesVal, indicesVal);
+        auto meshResult = renderer->createMesh(meshName, verticesVal, indicesVal);
+        chunk.mesh = emscripten::val(meshResult);  // ✅ Conversión explícita
     }
     
     emscripten::val createChunkCollision(TerrainChunk& chunk) {
@@ -8420,8 +8421,8 @@ public:
         
         for (int i = 0; i < instancesToPlace; i++) {
             // Posición aleatoria en el terreno
-            float worldX = (static_cast<float>(rand()) / RAND_MAX - 0.5f) * chunksPerDimension * chunkSize;
-            float worldZ = (static_cast<float>(rand()) / RAND_MAX - 0.5f) * chunksPerDimension * chunkSize;
+            float worldX = (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f) * chunksPerDimension * chunkSize;
+            float worldZ = (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f) * chunksPerDimension * chunkSize;
             float height = getHeightAt(worldX, worldZ);
             
             // Verificar si la posición es válida para este tipo de follaje
@@ -8430,8 +8431,8 @@ public:
                 instance.x = worldX;
                 instance.y = height;
                 instance.z = worldZ;
-                instance.scale = foliageType.minScale + static_cast<float>(rand()) / RAND_MAX * (foliageType.maxScale - foliageType.minScale);
-                instance.rotation = static_cast<float>(rand()) / RAND_MAX * 6.28318f; // 0-2π
+                instance.scale = foliageType.minScale + static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * (foliageType.maxScale - foliageType.minScale);
+                instance.rotation = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * 6.28318f;
                 instance.type = std::hash<std::string>{}(foliageType.name); // Hash para tipo
                 instance.alive = true;
                 
@@ -11269,7 +11270,7 @@ EMSCRIPTEN_BINDINGS(ultra_game_engine_complete) {
         .function("draw", &UltraVisualEditor::draw)
         .function("update", &UltraVisualEditor::update)
         .function("saveScene", &UltraVisualEditor::saveScene)
-        .function("loadScene", &UltraVisualEditor::loadScene)
+        .function("loadScene", &UltraSceneManager::loadScene)  // ✅ Método correcto
         .function("getEditorState", &UltraVisualEditor::getEditorState);
 
     // UltraTerrainSystem
